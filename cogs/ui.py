@@ -1027,7 +1027,6 @@ class SpotifyUI(_DashboardBaseView):
         )
         self._v2_header_container = container_cls(
             self._v2_section,
-            accent_colour=discord.Colour(0x2B2D31),
         )
 
         self.add_item(self._v2_header_container)
@@ -1049,13 +1048,13 @@ class SpotifyUI(_DashboardBaseView):
 
         # LayoutView does not materialize decorator-defined controls, so create them explicitly.
         self.previous_track = discord.ui.Button(
-            style=discord.ButtonStyle.secondary, emoji="|◁", label="", row=0
+            style=discord.ButtonStyle.secondary, emoji=None, label="|◁", row=0
         )
         self.pause_resume = discord.ui.Button(
-            style=discord.ButtonStyle.secondary, emoji="||", label="", row=0
+            style=discord.ButtonStyle.secondary, emoji=None, label="||", row=0
         )
         self.skip_track = discord.ui.Button(
-            style=discord.ButtonStyle.secondary, emoji="▷|", label="", row=0
+            style=discord.ButtonStyle.secondary, emoji=None, label="▷|", row=0
         )
         self.shuffle_queue = discord.ui.Button(
             style=discord.ButtonStyle.secondary, emoji="🔀", label="", row=1
@@ -1184,7 +1183,6 @@ class SpotifyUI(_DashboardBaseView):
             self._v2_progress_text.content = (
                 f"{_PLAYBAR_LEFT_PAD}`{_progress_bar_blocks(0, 1, width=32)}  0:00 / 0:00`"
             )
-            self._v2_header_container.accent_colour = discord.Colour(0x2B2D31)
             try:
                 if self._v2_fallback_accessory:
                     self._v2_section.accessory = self._v2_fallback_accessory
@@ -1210,8 +1208,6 @@ class SpotifyUI(_DashboardBaseView):
             self._v2_title_text.content = f"### {song_artist_label}"
         self._v2_meta_text.content = "\u200b"
         self._v2_progress_text.content = f"{_PLAYBAR_LEFT_PAD}`{block_bar}  {timer_text}`"
-        self._v2_header_container.accent_colour = discord.Colour(0x2B2D31)
-
         artwork_url = str(getattr(track, "artwork", "") or "").strip()
         thumbnail_cls = getattr(discord.ui, "Thumbnail", None)
         if artwork_url == self._v2_thumb_url:
@@ -1513,7 +1509,7 @@ class SpotifyUI(_DashboardBaseView):
             embed.set_image(url=track.artwork)
         return embed
 
-    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="|◁", label="", row=0)
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="|◁", row=0)
     async def previous_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
@@ -1523,7 +1519,7 @@ class SpotifyUI(_DashboardBaseView):
             await player.seek(0)
         await self.update_player_message()
 
-    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="||", label="", row=0)
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="||", row=0)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
@@ -1544,7 +1540,7 @@ class SpotifyUI(_DashboardBaseView):
         await asyncio.sleep(0.15)
         await self.update_player_message(force=True)
 
-    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="▷|", label="", row=0)
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="▷|", row=0)
     async def skip_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
