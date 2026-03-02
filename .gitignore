@@ -1,0 +1,52 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Local caches
+.cache
+.cache/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Runtime / temp files
+*.pid
+*.pid.lock
+*.tmp
+*.temp
+
+# Bot runtime data (generated/volatile)
+data/resolved_track_links.json
+
+# Lavalink / plugin binaries (local dependencies)
+Lavalink.jar
+plugins/*.jar
