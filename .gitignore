@@ -49,4 +49,5 @@ data/resolved_track_links.json
 
 # Lavalink / plugin binaries (local dependencies)
 Lavalink.jar
+.lavalink_version
 plugins/*.jar
