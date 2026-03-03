@@ -23,6 +23,10 @@ class ResolvedTrack:
     title: str
     artist: str
     added_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+    isrc: Optional[str] = None
+    album: Optional[str] = None
+    spotify_track_id: Optional[str] = None
     
     @property
     def query(self) -> str:
@@ -138,7 +142,32 @@ class SpotifyResolver:
             if title and artist:
                 added_at_raw = item.get("added_at")
                 added_at = str(added_at_raw).strip() if isinstance(added_at_raw, str) else None
-                parsed.append(ResolvedTrack(title=title, artist=artist, added_at=added_at or None))
+                duration_ms_raw = item.get("duration_ms")
+                try:
+                    duration_ms = int(duration_ms_raw) if duration_ms_raw is not None else None
+                except (TypeError, ValueError):
+                    duration_ms = None
+                if duration_ms is not None and duration_ms <= 0:
+                    duration_ms = None
+
+                isrc_raw = item.get("isrc")
+                isrc = str(isrc_raw).strip().upper() if isinstance(isrc_raw, str) and isrc_raw.strip() else None
+                album_raw = item.get("album")
+                album = str(album_raw).strip() if isinstance(album_raw, str) and album_raw.strip() else None
+                track_id_raw = item.get("spotify_track_id")
+                track_id = str(track_id_raw).strip() if isinstance(track_id_raw, str) and track_id_raw.strip() else None
+
+                parsed.append(
+                    ResolvedTrack(
+                        title=title,
+                        artist=artist,
+                        added_at=added_at or None,
+                        duration_ms=duration_ms,
+                        isrc=isrc,
+                        album=album,
+                        spotify_track_id=track_id,
+                    )
+                )
         return parsed
 
     def _get_cached_playlist_tracks(self, playlist_key: str, force_cache_bypass: bool) -> List[ResolvedTrack]:
@@ -181,6 +210,10 @@ class SpotifyResolver:
                     "title": t.title,
                     "artist": t.artist,
                     "added_at": t.added_at,
+                    "duration_ms": t.duration_ms,
+                    "isrc": t.isrc,
+                    "album": t.album,
+                    "spotify_track_id": t.spotify_track_id,
                 }
                 for t in tracks
             ],
@@ -234,7 +267,16 @@ class SpotifyResolver:
         return ""
 
     @staticmethod
-    def _build_track(title: Any, artist: Any, *, added_at: Optional[Any] = None) -> Optional[ResolvedTrack]:
+    def _build_track(
+        title: Any,
+        artist: Any,
+        *,
+        added_at: Optional[Any] = None,
+        duration_ms: Optional[Any] = None,
+        isrc: Optional[Any] = None,
+        album: Optional[Any] = None,
+        spotify_track_id: Optional[Any] = None,
+    ) -> Optional[ResolvedTrack]:
         if not isinstance(title, str) or not isinstance(artist, str):
             return None
         title = title.strip()
@@ -242,7 +284,27 @@ class SpotifyResolver:
         if not title or not artist:
             return None
         parsed_added_at = str(added_at).strip() if isinstance(added_at, str) and added_at.strip() else None
-        return ResolvedTrack(title=title, artist=artist, added_at=parsed_added_at)
+        try:
+            parsed_duration_ms = int(duration_ms) if duration_ms is not None else None
+        except (TypeError, ValueError):
+            parsed_duration_ms = None
+        if parsed_duration_ms is not None and parsed_duration_ms <= 0:
+            parsed_duration_ms = None
+
+        parsed_isrc = str(isrc).strip().upper() if isinstance(isrc, str) and isrc.strip() else None
+        parsed_album = str(album).strip() if isinstance(album, str) and album.strip() else None
+        parsed_track_id = (
+            str(spotify_track_id).strip() if isinstance(spotify_track_id, str) and spotify_track_id.strip() else None
+        )
+        return ResolvedTrack(
+            title=title,
+            artist=artist,
+            added_at=parsed_added_at,
+            duration_ms=parsed_duration_ms,
+            isrc=parsed_isrc,
+            album=parsed_album,
+            spotify_track_id=parsed_track_id,
+        )
 
     def _get_app_access_token(self) -> Optional[str]:
         if not self._spotify:
@@ -469,6 +531,10 @@ class SpotifyResolver:
             candidate.get("name"),
             self._extract_first_artist_name(candidate.get("artists")),
             added_at=item.get("added_at"),
+            duration_ms=candidate.get("duration_ms"),
+            isrc=(candidate.get("external_ids") or {}).get("isrc") if isinstance(candidate.get("external_ids"), dict) else None,
+            album=(candidate.get("album") or {}).get("name") if isinstance(candidate.get("album"), dict) else None,
+            spotify_track_id=candidate.get("id"),
         )
 
     async def _fetch_playlist_items_api(self, playlist_id: str, *, use_user_token: bool) -> List[ResolvedTrack]:
@@ -539,6 +605,10 @@ class SpotifyResolver:
                 track = self._build_track(
                     item.get("name"),
                     self._extract_first_artist_name(item.get("artists")),
+                    duration_ms=item.get("duration_ms"),
+                    isrc=(item.get("external_ids") or {}).get("isrc") if isinstance(item.get("external_ids"), dict) else None,
+                    album=(item.get("album") or {}).get("name") if isinstance(item.get("album"), dict) else None,
+                    spotify_track_id=item.get("id"),
                 )
                 if track:
                     tracks.append(track)
@@ -797,7 +867,15 @@ class SpotifyResolver:
                 track_id = url.split("/track/")[1].split("?")[0]
                 track = await asyncio.to_thread(self._spotify.track, track_id)
                 if track and 'name' in track and track['artists']:
-                    return ResolvedTrack(track['name'], track['artists'][0]['name'])
+                    external_ids = track.get("external_ids") if isinstance(track.get("external_ids"), dict) else {}
+                    return ResolvedTrack(
+                        title=track['name'],
+                        artist=track['artists'][0]['name'],
+                        duration_ms=track.get("duration_ms"),
+                        isrc=external_ids.get("isrc"),
+                        album=((track.get("album") or {}).get("name") if isinstance(track.get("album"), dict) else None),
+                        spotify_track_id=track_id,
+                    )
             except Exception as exc:
                 logging.debug(f"Spotipy single-track lookup failed; falling back to scrape: {exc}")
                 
@@ -820,7 +898,10 @@ class SpotifyResolver:
                     parts = full_title.split(" - song and lyrics by ")
                     song_name = parts[0].strip()
                     artist_name = parts[1].split(" | Spotify")[0].strip()
-                    return ResolvedTrack(song_name, artist_name)
+                    track_id = ""
+                    if "/track/" in url:
+                        track_id = url.split("/track/")[1].split("?")[0].strip()
+                    return ResolvedTrack(song_name, artist_name, spotify_track_id=(track_id or None))
                     
                 return None
         except Exception as e:

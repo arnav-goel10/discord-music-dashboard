@@ -8,6 +8,7 @@ A Discord music bot with an interactive `/music` dashboard, queue controls, Spot
 - Queue actions: add, view, save playlists, shuffle
 - Playback controls: restart, pause/resume, skip, loop
 - Volume and audio effects controls
+- Lyrics support (dashboard `🎤` button) with live line sync, exact-first matching, provider fallback, and cache
 - Spotify playlist ingestion with background resolution and cache
 - Lavalink backend with YouTube plugin + lavasrc integration
 
@@ -44,6 +45,33 @@ Spotify (recommended):
 - `SPOTIFY_CLIENT_ID`
 - `SPOTIFY_CLIENT_SECRET`
 - `SPOTIFY_REDIRECT_URI` (must exactly match Spotify Dashboard)
+
+Resolver quality (optional):
+
+- `TRACK_RESOLVER_PER_QUERY_LIMIT`
+- `TRACK_RESOLVER_MAX_CANDIDATES`
+- `TRACK_RESOLVER_MIN_CACHE_SCORE`
+- `TRACK_RESOLVER_MIN_CACHE_MARGIN`
+
+Optional ML reranker:
+
+- Install extra deps: `pip install sentence-transformers torch`
+- Set `TRACK_RESOLVER_ML_RERANK_ENABLED=1`
+- Optionally override `TRACK_RESOLVER_ML_RERANK_MODEL`
+
+Lyrics (optional):
+
+- `LYRICS_CACHE_ENABLED`
+- `LYRICS_CACHE_TTL_SECONDS`
+- `LYRICS_PREFER_SYNCED`
+- `LYRICS_LRCLIB_EXACT_MIN_SCORE`
+- `LYRICS_LRCLIB_SEARCH_MIN_SCORE`
+- Optional unofficial Spotify synced-lyrics path:
+- `LYRICS_SPOTIFY_UNOFFICIAL_ENABLED`
+- `LYRICS_SPOTIFY_MARKET`
+- `LYRICS_SPOTIFY_WEB_TOKEN` / `LYRICS_SPOTIFY_WEB_TOKEN_AUTO`
+- Note: Spotify lyrics endpoint is unofficial and may change/break without notice.
+- Optional Genius fallback: set `GENIUS_ACCESS_TOKEN`
 
 ## 3) Spotify OAuth user token (recommended)
 
