@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 from bs4 import BeautifulSoup
 import base64
+import contextvars
 import datetime
 from dataclasses import dataclass
 import json
@@ -55,8 +56,12 @@ class SpotifyResolver:
                     datetime.timezone.utc
                 ) + datetime.timedelta(minutes=45)
 
-        self._last_failure_code: Optional[str] = None
-        self._last_failure_message: str = ""
+        self._failure_code_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+            "spotify_failure_code", default=None
+        )
+        self._failure_message_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "spotify_failure_message", default=""
+        )
         self.cache_file = os.path.join(_DATA_DIR, "playlists.json")
         self.cache = self._load_cache()
         
@@ -191,19 +196,19 @@ class SpotifyResolver:
 
     @property
     def last_failure_code(self) -> Optional[str]:
-        return self._last_failure_code
+        return self._failure_code_ctx.get()
 
     @property
     def last_failure_message(self) -> str:
-        return self._last_failure_message
+        return self._failure_message_ctx.get()
 
     def _set_failure(self, code: str, message: str) -> None:
-        self._last_failure_code = code
-        self._last_failure_message = message
+        self._failure_code_ctx.set(code)
+        self._failure_message_ctx.set(message)
 
     def _clear_failure(self) -> None:
-        self._last_failure_code = None
-        self._last_failure_message = ""
+        self._failure_code_ctx.set(None)
+        self._failure_message_ctx.set("")
 
     @staticmethod
     def _extract_first_artist_name(artists: Any) -> str:

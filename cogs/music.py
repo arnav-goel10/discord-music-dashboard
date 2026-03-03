@@ -614,6 +614,9 @@ class Music(commands.Cog):
 
     def _cleanup_player_scope(self, player: wavelink.Player) -> None:
         scope_id = self._player_scope_id(player)
+        self._cleanup_scope_id(scope_id)
+
+    def _cleanup_scope_id(self, scope_id: int) -> None:
         self._player_action_locks.pop(scope_id, None)
         self._manual_advance_until.pop(scope_id, None)
         self._exception_streak.pop(scope_id, None)
@@ -638,6 +641,9 @@ class Music(commands.Cog):
 
     async def _cancel_playlist_loading(self, player: wavelink.Player) -> None:
         scope_id = self._player_scope_id(player)
+        await self._cancel_playlist_loading_by_scope_id(scope_id)
+
+    async def _cancel_playlist_loading_by_scope_id(self, scope_id: int) -> None:
         task = self._playlist_load_tasks.pop(scope_id, None)
         self._queue_busy_reason.pop(scope_id, None)
         if not task or task.done():
@@ -856,6 +862,56 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
         print(f"Wavelink Node connected: {payload.node!r} | Resumed: {payload.resumed}")
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        bot_user = self.bot.user
+        if not bot_user or member.id != bot_user.id:
+            return
+
+        guild = getattr(member, "guild", None)
+        if not guild or before.channel is None or after.channel is not None:
+            return
+
+        scope_id = int(guild.id)
+        player = self._player_for_guild_id(scope_id)
+
+        if player:
+            ui_message = getattr(player, "ui_message", None)
+            if ui_message:
+                try:
+                    await ui_message.delete()
+                except Exception:
+                    pass
+                finally:
+                    player.ui_message = None
+
+            ui_view = getattr(player, "ui_view", None)
+            if ui_view:
+                try:
+                    ui_view.stop()
+                except Exception:
+                    pass
+                finally:
+                    player.ui_view = None
+
+            await self._cancel_playlist_loading(player)
+            self._cleanup_player_scope(player)
+            return
+
+        await self._cancel_playlist_loading_by_scope_id(scope_id)
+        self._cleanup_scope_id(scope_id)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        scope_id = int(guild.id)
+        await self._cancel_playlist_loading_by_scope_id(scope_id)
+        self._cleanup_scope_id(scope_id)
 
     @commands.Cog.listener()
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):

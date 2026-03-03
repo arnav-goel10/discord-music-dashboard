@@ -1,16 +1,16 @@
-import json
 import os
 import logging
 import asyncio
 import time
 import re
+import sqlite3
 import discord
 import wavelink
 from typing import Optional, Any
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
-_GOOD_PLAYLIST_PATH = os.path.join(_DATA_DIR, "good_playlist.json")
-_SAVED_PLAYLISTS_PATH = os.path.join(_DATA_DIR, "saved_playlists.json")
+_PLAYLIST_DB_PATH = os.path.join(_DATA_DIR, "music_bot.db")
+_SAVED_PLAYLIST_DB_READY = False
 _MAX_SAVED_PLAYLISTS = 3
 _PLAYBAR_LEFT_PAD = "\u2002\u2002"
 
@@ -131,41 +131,36 @@ def _playlist_token_from_url(url: str) -> str:
     return f"{token[:6]}...{token[-4:]}"
 
 
-def _read_json_file(path: str) -> Any:
+def _db_connect() -> sqlite3.Connection:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(_PLAYLIST_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _normalize_scope_id(raw: Any) -> int:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
-def _load_saved_playlists() -> list[dict[str, Any]]:
+def _sanitize_saved_playlist_items(raw_items: Any) -> list[dict[str, Any]]:
     now_ts = int(time.time())
-    raw = _read_json_file(_SAVED_PLAYLISTS_PATH)
     parsed: list[dict[str, Any]] = []
 
-    if isinstance(raw, dict):
-        raw_playlists = raw.get("playlists")
-        if isinstance(raw_playlists, list):
-            for item in raw_playlists:
-                if not isinstance(item, dict):
-                    continue
-                url = _normalize_spotify_playlist_url(str(item.get("url", "")))
-                if not url:
-                    continue
-                try:
-                    saved_at = int(item.get("saved_at", now_ts))
-                except (TypeError, ValueError):
-                    saved_at = now_ts
-                parsed.append({"url": url, "saved_at": saved_at})
-
-    # Legacy migration for old single-list format.
-    if not parsed and os.path.exists(_GOOD_PLAYLIST_PATH):
-        legacy = _read_json_file(_GOOD_PLAYLIST_PATH)
-        if isinstance(legacy, dict):
-            legacy_url = _normalize_spotify_playlist_url(str(legacy.get("url", "")))
-            if legacy_url:
-                parsed.append({"url": legacy_url, "saved_at": now_ts})
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            url = _normalize_spotify_playlist_url(str(item.get("url", "")))
+            if not url:
+                continue
+            try:
+                saved_at = int(item.get("saved_at", now_ts))
+            except (TypeError, ValueError):
+                saved_at = now_ts
+            parsed.append({"url": url, "saved_at": saved_at})
 
     deduped: dict[str, dict[str, Any]] = {}
     for item in parsed:
@@ -177,20 +172,83 @@ def _load_saved_playlists() -> list[dict[str, Any]]:
     return ordered[:_MAX_SAVED_PLAYLISTS]
 
 
-def _save_saved_playlists(playlists: list[dict[str, Any]]) -> None:
-    os.makedirs(_DATA_DIR, exist_ok=True)
-    payload = {"playlists": playlists[:_MAX_SAVED_PLAYLISTS]}
-    with open(_SAVED_PLAYLISTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+def _ensure_saved_playlists_storage() -> None:
+    global _SAVED_PLAYLIST_DB_READY
+    if _SAVED_PLAYLIST_DB_READY:
+        return
+
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_playlists (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                saved_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id, url)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_saved_playlists_scope_saved_at
+            ON saved_playlists (guild_id, user_id, saved_at DESC)
+            """
+        )
+        conn.commit()
+
+    _SAVED_PLAYLIST_DB_READY = True
 
 
-def _upsert_saved_playlist(url: str) -> tuple[list[dict[str, Any]], bool]:
-    playlists = _load_saved_playlists()
+def _load_saved_playlists(guild_id: int, user_id: int) -> list[dict[str, Any]]:
+    guild_scope = _normalize_scope_id(guild_id)
+    user_scope = _normalize_scope_id(user_id)
+    _ensure_saved_playlists_storage()
+    with _db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT url, saved_at
+            FROM saved_playlists
+            WHERE guild_id = ? AND user_id = ?
+            ORDER BY saved_at DESC
+            LIMIT ?
+            """,
+            (guild_scope, user_scope, _MAX_SAVED_PLAYLISTS),
+        ).fetchall()
+
+    parsed = []
+    for row in rows:
+        url = _normalize_spotify_playlist_url(str(row["url"]))
+        if not url:
+            continue
+        parsed.append({"url": url, "saved_at": int(row["saved_at"])})
+    return _sanitize_saved_playlist_items(parsed)
+
+
+def _save_saved_playlists(guild_id: int, user_id: int, playlists: list[dict[str, Any]]) -> None:
+    guild_scope = _normalize_scope_id(guild_id)
+    user_scope = _normalize_scope_id(user_id)
+    _ensure_saved_playlists_storage()
+    cleaned = _sanitize_saved_playlist_items(playlists)
+    with _db_connect() as conn:
+        conn.execute(
+            "DELETE FROM saved_playlists WHERE guild_id = ? AND user_id = ?",
+            (guild_scope, user_scope),
+        )
+        conn.executemany(
+            "INSERT INTO saved_playlists (guild_id, user_id, url, saved_at) VALUES (?, ?, ?, ?)",
+            [(guild_scope, user_scope, item["url"], int(item["saved_at"])) for item in cleaned],
+        )
+        conn.commit()
+
+
+def _upsert_saved_playlist(url: str, guild_id: int, user_id: int) -> tuple[list[dict[str, Any]], bool]:
+    playlists = _load_saved_playlists(guild_id, user_id)
     playlists = [item for item in playlists if item.get("url") != url]
     playlists.insert(0, {"url": url, "saved_at": int(time.time())})
     trimmed = len(playlists) > _MAX_SAVED_PLAYLISTS
     playlists = playlists[:_MAX_SAVED_PLAYLISTS]
-    _save_saved_playlists(playlists)
+    _save_saved_playlists(guild_id, user_id, playlists)
     return playlists, trimmed
 
 
@@ -259,7 +317,13 @@ class SavePlaylistModal(discord.ui.Modal, title="Save Spotify Playlist"):
             )
             return
 
-        playlists, trimmed = _upsert_saved_playlist(url)
+        owner_user_id = self.parent_view.owner_user_id if self.parent_view else int(interaction.user.id)
+        owner_guild_id = (
+            self.parent_view.owner_guild_id
+            if self.parent_view
+            else _normalize_scope_id(getattr(getattr(interaction, "guild", None), "id", 0))
+        )
+        playlists, trimmed = _upsert_saved_playlist(url, owner_guild_id, owner_user_id)
         token = _playlist_token_from_url(url)
         if trimmed:
             message = (
@@ -326,7 +390,7 @@ class EditSavedPlaylistModal(discord.ui.Modal, title="Edit Saved Playlist URL"):
             )
 
         deduped = deduped[:_MAX_SAVED_PLAYLISTS]
-        _save_saved_playlists(deduped)
+        _save_saved_playlists(self.parent_view.owner_guild_id, self.parent_view.owner_user_id, deduped)
 
         self.parent_view.playlists = deduped
         self.parent_view.selected_index = min(self.index, len(deduped) - 1) if deduped else -1
@@ -336,10 +400,12 @@ class EditSavedPlaylistModal(discord.ui.Modal, title="Edit Saved Playlist URL"):
 
 
 class SavedPlaylistManagerView(discord.ui.View):
-    def __init__(self, dashboard: "SpotifyUI"):
+    def __init__(self, dashboard: "SpotifyUI", owner_user_id: int, owner_guild_id: int):
         super().__init__(timeout=180)
         self.dashboard = dashboard
-        self.playlists: list[dict[str, Any]] = _load_saved_playlists()
+        self.owner_user_id = int(owner_user_id)
+        self.owner_guild_id = _normalize_scope_id(owner_guild_id)
+        self.playlists: list[dict[str, Any]] = _load_saved_playlists(self.owner_guild_id, self.owner_user_id)
         self.selected_index: int = 0 if self.playlists else -1
         default_order = str(getattr(self.dashboard, "_saved_playlist_order", "recent") or "recent")
         self.play_order = default_order if default_order in {"recent", "spotify"} else "recent"
@@ -498,7 +564,7 @@ class SavedPlaylistManagerView(discord.ui.View):
             return
 
         removed = self.playlists.pop(self.selected_index)
-        _save_saved_playlists(self.playlists)
+        _save_saved_playlists(self.owner_guild_id, self.owner_user_id, self.playlists)
 
         if self.playlists:
             self.selected_index = min(self.selected_index, len(self.playlists) - 1)
@@ -1626,7 +1692,11 @@ class SpotifyUI(_DashboardBaseView):
 
     @discord.ui.button(style=discord.ButtonStyle.primary, emoji="💾", label="", row=1)
     async def manage_lists(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        view = SavedPlaylistManagerView(self)
+        view = SavedPlaylistManagerView(
+            self,
+            owner_user_id=int(interaction.user.id),
+            owner_guild_id=_normalize_scope_id(getattr(getattr(interaction, "guild", None), "id", 0)),
+        )
         await interaction.response.send_message(
             content=view._build_content(),
             view=view,

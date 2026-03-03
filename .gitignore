@@ -46,6 +46,9 @@ logs/
 
 # Bot runtime data (generated/volatile)
 data/resolved_track_links.json
+data/music_bot.db
+data/music_bot.db-shm
+data/music_bot.db-wal
 
 # Lavalink / plugin binaries (local dependencies)
 Lavalink.jar

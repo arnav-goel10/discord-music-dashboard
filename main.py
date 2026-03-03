@@ -10,18 +10,45 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
+AUTO_SHARDING_ENABLED = (os.getenv("AUTO_SHARDING_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"})
 
-class MusicBot(commands.Bot):
+_BotBase = commands.AutoShardedBot if AUTO_SHARDING_ENABLED else commands.Bot
+
+
+class MusicBot(_BotBase):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         self._startup_sync_done = False
-        
-        super().__init__(
-            command_prefix="!", 
-            intents=intents,
-            help_command=None
-        )
+
+        bot_kwargs: dict[str, object] = {
+            "command_prefix": "!",
+            "intents": intents,
+            "help_command": None,
+        }
+        if AUTO_SHARDING_ENABLED:
+            shard_count_raw = (os.getenv("DISCORD_SHARD_COUNT") or "").strip()
+            if shard_count_raw:
+                try:
+                    shard_count = max(1, int(shard_count_raw))
+                    bot_kwargs["shard_count"] = shard_count
+                except ValueError:
+                    print(f"WARNING: Invalid DISCORD_SHARD_COUNT='{shard_count_raw}', ignoring.")
+
+            shard_ids_raw = (os.getenv("DISCORD_SHARD_IDS") or "").strip()
+            if shard_ids_raw:
+                try:
+                    shard_ids = [
+                        int(part.strip())
+                        for part in shard_ids_raw.split(",")
+                        if part.strip()
+                    ]
+                    if shard_ids:
+                        bot_kwargs["shard_ids"] = shard_ids
+                except ValueError:
+                    print(f"WARNING: Invalid DISCORD_SHARD_IDS='{shard_ids_raw}', ignoring.")
+
+        super().__init__(**bot_kwargs)
 
     async def setup_hook(self):
         # Load the music cog
@@ -47,6 +74,8 @@ class MusicBot(commands.Bot):
         # Avoid repeating things on every reconnect.
         if not self._startup_sync_done:
             self._startup_sync_done = True
+            if AUTO_SHARDING_ENABLED:
+                print(f"Auto sharding enabled. Active shard count: {self.shard_count}")
             print("Startup sync logic complete!")
         print("Bot is fully ready and commands are live!")
 
