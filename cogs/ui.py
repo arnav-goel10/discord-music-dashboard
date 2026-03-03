@@ -35,11 +35,29 @@ def _progress_bar_blocks(position_ms: int, length_ms: int, *, width: int = 20) -
         return "[" + ("░" * width) + "]"
 
     ratio = max(0.0, min(1.0, position_ms / length_ms))
-    # Use the standard text-progress approach: floor(progress * width).
-    filled = max(0, min(width, int(ratio * width)))
-    if position_ms >= length_ms:
-        filled = width
-    return "[" + ("█" * filled) + ("░" * (width - filled)) + "]"
+    # Smooth per-cell progression: ░ -> ▒ -> ▓ -> █
+    if ratio >= 1.0 or position_ms >= length_ms:
+        return "[" + ("█" * width) + "]"
+
+    exact = ratio * width
+    full = int(exact)
+    remainder = exact - full
+
+    partial = ""
+    if full < width:
+        if remainder >= (2 / 3):
+            partial = "█"
+        elif remainder >= (1 / 3):
+            partial = "▓"
+        elif remainder > 0:
+            partial = "▒"
+
+    if partial == "█":
+        full += 1
+        partial = ""
+
+    empty = max(0, width - full - (1 if partial else 0))
+    return "[" + ("█" * full) + partial + ("░" * empty) + "]"
 
 
 def _clip(text: str, max_len: int) -> str:
