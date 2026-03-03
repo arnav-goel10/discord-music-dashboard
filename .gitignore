@@ -45,6 +45,7 @@ logs/
 *.temp
 
 # Bot runtime data (generated/volatile)
+data/lyrics_cache.json
 data/resolved_track_links.json
 data/music_bot.db
 data/music_bot.db-shm

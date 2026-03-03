@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import urllib.parse
 from typing import Any, Optional
@@ -31,7 +32,7 @@ class LyricsResolver:
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        self._cache_file = os.path.join(_DATA_DIR, "lyrics_cache.json")
+        self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
         self._cache_enabled = self._env_bool("LYRICS_CACHE_ENABLED", True)
         self._cache_ttl_seconds = self._env_int("LYRICS_CACHE_TTL_SECONDS", 1_209_600, minimum=0)
         self._prefer_synced = self._env_bool("LYRICS_PREFER_SYNCED", False)
@@ -56,6 +57,7 @@ class LyricsResolver:
         self._spotify_web_token_expiry = 0.0
         self._spotify_token_lock = asyncio.Lock()
 
+        self._ensure_cache_table()
         self._cache = self._load_cache()
 
     @staticmethod
@@ -98,6 +100,42 @@ class LyricsResolver:
                 },
             )
         return self._session
+
+    def _db_connect(self) -> sqlite3.Connection:
+        os.makedirs(os.path.dirname(self._cache_db_path), exist_ok=True)
+        conn = sqlite3.connect(self._cache_db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_cache_table(self) -> None:
+        if not self._cache_enabled:
+            return
+        try:
+            with self._db_connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lyrics_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        artist TEXT,
+                        lyrics TEXT NOT NULL,
+                        source TEXT,
+                        synced INTEGER NOT NULL,
+                        source_url TEXT,
+                        synced_lyrics TEXT,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lyrics_cache_updated_at
+                    ON lyrics_cache (updated_at)
+                    """
+                )
+                conn.commit()
+        except Exception as exc:
+            logging.warning("Failed ensuring lyrics_cache table: %s", exc)
 
     @staticmethod
     def _normalize_text(raw: Optional[str]) -> str:
@@ -461,38 +499,38 @@ class LyricsResolver:
     def _load_cache(self) -> dict[str, dict[str, Any]]:
         if not self._cache_enabled:
             return {}
-        if not os.path.exists(self._cache_file):
-            return {}
-
         try:
-            with open(self._cache_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
+            with self._db_connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT cache_key, title, artist, lyrics, source, synced, source_url, synced_lyrics, updated_at
+                    FROM lyrics_cache
+                    """
+                ).fetchall()
         except Exception as exc:
-            logging.warning("Failed reading lyrics cache: %s", exc)
-            return {}
-
-        if not isinstance(raw, dict):
+            logging.warning("Failed reading lyrics cache from DB: %s", exc)
             return {}
 
         now = int(time.time())
         parsed: dict[str, dict[str, Any]] = {}
         changed = False
-        for key, value in raw.items():
-            if not isinstance(key, str) or not isinstance(value, dict):
+        for row in rows:
+            key = str(row["cache_key"] or "").strip()
+            if not key:
                 changed = True
                 continue
             try:
-                updated_at = int(value.get("updated_at", 0))
+                updated_at = int(row["updated_at"] or 0)
             except (TypeError, ValueError):
                 updated_at = 0
             if self._cache_ttl_seconds > 0 and updated_at and (now - updated_at) > self._cache_ttl_seconds:
                 changed = True
                 continue
 
-            lyrics = self._clean_lyrics(value.get("lyrics"))
-            title = str(value.get("title", "")).strip()
-            artist = str(value.get("artist", "")).strip()
-            source = str(value.get("source", "")).strip()
+            lyrics = self._clean_lyrics(row["lyrics"])
+            title = str(row["title"] or "").strip()
+            artist = str(row["artist"] or "").strip()
+            source = str(row["source"] or "").strip()
             if "genius" in source.lower():
                 cleaned_genius = self._clean_genius_lyrics(lyrics, title_hint=title)
                 if cleaned_genius and cleaned_genius != lyrics:
@@ -507,9 +545,9 @@ class LyricsResolver:
                 "artist": artist,
                 "lyrics": lyrics,
                 "source": source,
-                "synced": bool(value.get("synced", False)),
-                "source_url": value.get("source_url"),
-                "synced_lyrics": self._clean_lyrics(value.get("synced_lyrics")) or None,
+                "synced": bool(row["synced"]),
+                "source_url": str(row["source_url"] or "").strip() or None,
+                "synced_lyrics": self._clean_lyrics(row["synced_lyrics"]) or None,
                 "updated_at": updated_at or now,
             }
 
@@ -522,11 +560,48 @@ class LyricsResolver:
         if not self._cache_enabled:
             return
         try:
-            os.makedirs(os.path.dirname(self._cache_file), exist_ok=True)
-            with open(self._cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, indent=2, ensure_ascii=False)
+            rows: list[tuple[str, str, str, str, str, int, Optional[str], Optional[str], int]] = []
+            for key, value in self._cache.items():
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    continue
+                title = str(value.get("title", "")).strip()
+                lyrics = self._clean_lyrics(value.get("lyrics"))
+                if not title or not lyrics:
+                    continue
+                artist = str(value.get("artist", "")).strip()
+                source = str(value.get("source", "")).strip()
+                source_url = str(value.get("source_url", "")).strip() or None
+                synced_lyrics = self._clean_lyrics(value.get("synced_lyrics")) or None
+                try:
+                    updated_at = int(value.get("updated_at", int(time.time())))
+                except (TypeError, ValueError):
+                    updated_at = int(time.time())
+                rows.append(
+                    (
+                        key,
+                        title,
+                        artist,
+                        lyrics,
+                        source,
+                        1 if bool(value.get("synced", False)) else 0,
+                        source_url,
+                        synced_lyrics,
+                        updated_at,
+                    )
+                )
+            with self._db_connect() as conn:
+                conn.execute("DELETE FROM lyrics_cache")
+                conn.executemany(
+                    """
+                    INSERT INTO lyrics_cache
+                    (cache_key, title, artist, lyrics, source, synced, source_url, synced_lyrics, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
         except Exception as exc:
-            logging.warning("Failed writing lyrics cache: %s", exc)
+            logging.warning("Failed writing lyrics cache to DB: %s", exc)
 
     def _get_cached(self, keys: list[str]) -> Optional[LyricsResult]:
         if not self._cache_enabled:

@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import time
 from typing import Any, List, Optional
 import urllib.parse
 
@@ -66,8 +68,8 @@ class SpotifyResolver:
         self._failure_message_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
             "spotify_failure_message", default=""
         )
-        self.cache_file = os.path.join(_DATA_DIR, "playlists.json")
-        self.cache = self._load_cache()
+        self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
+        self._ensure_playlist_cache_table()
         
         # Initialize Spotipy if credentials exist
         client_id = self._spotify_client_id
@@ -109,25 +111,33 @@ class SpotifyResolver:
             )
         return self._session
 
-    def _load_cache(self):
-        try:
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                    if isinstance(loaded, dict):
-                        return loaded
-                    logging.warning("Playlist cache is not a dict; ignoring cache file.")
-        except Exception as e:
-            logging.error(f"Error loading playlist cache: {e}")
-        return {}
+    def _db_connect(self) -> sqlite3.Connection:
+        os.makedirs(os.path.dirname(self._cache_db_path), exist_ok=True)
+        conn = sqlite3.connect(self._cache_db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def _save_cache(self):
+    def _ensure_playlist_cache_table(self) -> None:
         try:
-            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(self.cache, f, indent=4)
-        except Exception as e:
-            logging.error(f"Error saving playlist cache: {e}")
+            with self._db_connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS playlist_cache (
+                        playlist_key TEXT PRIMARY KEY,
+                        updated_at INTEGER NOT NULL,
+                        tracks_json TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_playlist_cache_updated_at
+                    ON playlist_cache (updated_at)
+                    """
+                )
+                conn.commit()
+        except Exception as exc:
+            logging.error("Failed ensuring playlist_cache table: %s", exc)
 
     def _deserialize_tracks(self, raw_tracks: Any) -> List[ResolvedTrack]:
         if not isinstance(raw_tracks, list):
@@ -171,11 +181,23 @@ class SpotifyResolver:
         return parsed
 
     def _get_cached_playlist_tracks(self, playlist_key: str, force_cache_bypass: bool) -> List[ResolvedTrack]:
-        data = self.cache.get(playlist_key)
-        if not isinstance(data, dict):
+        try:
+            with self._db_connect() as conn:
+                row = conn.execute(
+                    "SELECT tracks_json, updated_at FROM playlist_cache WHERE playlist_key = ?",
+                    (playlist_key,),
+                ).fetchone()
+        except Exception as exc:
+            logging.warning("Failed reading playlist cache from DB: %s", exc)
+            return []
+        if row is None:
             return []
 
-        tracks = self._deserialize_tracks(data.get("tracks", []))
+        try:
+            tracks_raw = json.loads(str(row["tracks_json"] or "[]"))
+        except Exception:
+            tracks_raw = []
+        tracks = self._deserialize_tracks(tracks_raw)
         if not tracks:
             return []
 
@@ -183,13 +205,10 @@ class SpotifyResolver:
             logging.info(f"💾 Loaded PLAYLIST from local hard drive cache (forced): {playlist_key}")
             return tracks
 
-        timestamp = data.get("timestamp")
-        if not isinstance(timestamp, str):
-            return []
-
         try:
-            saved_time = datetime.datetime.fromisoformat(timestamp)
-        except ValueError:
+            updated_at = int(row["updated_at"])
+            saved_time = datetime.datetime.fromtimestamp(updated_at)
+        except (TypeError, ValueError, OSError):
             logging.warning(f"Invalid cache timestamp for {playlist_key}; refreshing snapshot.")
             return []
 
@@ -203,9 +222,8 @@ class SpotifyResolver:
         if not tracks:
             return
 
-        self.cache[playlist_key] = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "tracks": [
+        tracks_json = json.dumps(
+            [
                 {
                     "title": t.title,
                     "artist": t.artist,
@@ -217,15 +235,39 @@ class SpotifyResolver:
                 }
                 for t in tracks
             ],
-        }
-        self._save_cache()
+            ensure_ascii=False,
+        )
+        try:
+            with self._db_connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO playlist_cache (playlist_key, updated_at, tracks_json)
+                    VALUES (?, ?, ?)
+                    """,
+                    (playlist_key, int(time.time()), tracks_json),
+                )
+                conn.commit()
+        except Exception as exc:
+            logging.warning("Failed writing playlist cache snapshot to DB: %s", exc)
 
     def has_cached_playlist(self, url: str) -> bool:
         playlist_key = url.split("?")[0]
-        data = self.cache.get(playlist_key)
-        if not isinstance(data, dict):
+        try:
+            with self._db_connect() as conn:
+                row = conn.execute(
+                    "SELECT tracks_json FROM playlist_cache WHERE playlist_key = ?",
+                    (playlist_key,),
+                ).fetchone()
+        except Exception as exc:
+            logging.warning("Failed checking playlist cache in DB: %s", exc)
             return False
-        return bool(self._deserialize_tracks(data.get("tracks", [])))
+        if row is None:
+            return False
+        try:
+            tracks_raw = json.loads(str(row["tracks_json"] or "[]"))
+        except Exception:
+            return False
+        return bool(self._deserialize_tracks(tracks_raw))
 
     @property
     def last_failure_code(self) -> Optional[str]:
@@ -799,7 +841,7 @@ class SpotifyResolver:
         return resolved
 
     async def get_playlist_tracks(self, url: str, force_update: bool = False, force_cache_bypass: bool = False) -> List[ResolvedTrack]:
-        """Fetches tracks from a Spotify playlist or album securely. Uses local JSON caching (7 day TTL) to minimize Spotipy usage."""
+        """Fetches tracks from a Spotify playlist or album securely. Uses local SQLite caching (7 day TTL)."""
         playlist_key = url.split("?")[0]
         self._clear_failure()
 

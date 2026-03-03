@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import json
+import sqlite3
 import time
 import datetime
 import difflib
@@ -101,7 +102,7 @@ class Music(commands.Cog):
         self._playlist_load_tasks: dict[int, asyncio.Task] = {}
         self._queue_busy_reason: dict[int, str] = {}
         self._awaiting_autoplay: dict[int, asyncio.Event] = {}
-        self._resolved_links_cache_file = os.path.join(_DATA_DIR, "resolved_track_links.json")
+        self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
         self._resolved_links_cache_enabled = (
             os.getenv("RESOLVED_TRACK_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
         )
@@ -110,6 +111,7 @@ class Music(commands.Cog):
             self._resolved_links_cache_ttl_seconds = max(0, int(ttl_raw))
         except ValueError:
             self._resolved_links_cache_ttl_seconds = 2_592_000
+        self._ensure_resolved_links_cache_table()
         self._resolved_links_cache = self._load_resolved_links_cache()
         self._resolver_rrf_k = self._env_int("TRACK_RESOLVER_RRF_K", 20, minimum=1)
         self._resolver_rrf_scale = self._env_float("TRACK_RESOLVER_RRF_SCALE", 320.0, minimum=0.0)
@@ -214,84 +216,122 @@ class Music(commands.Cog):
 
         return keys
 
+    def _resolved_links_db_connect(self) -> sqlite3.Connection:
+        os.makedirs(os.path.dirname(self._cache_db_path), exist_ok=True)
+        conn = sqlite3.connect(self._cache_db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_resolved_links_cache_table(self) -> None:
+        if not self._resolved_links_cache_enabled:
+            return
+        try:
+            with self._resolved_links_db_connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS resolved_track_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        uri TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_resolved_track_cache_updated_at
+                    ON resolved_track_cache (updated_at)
+                    """
+                )
+                conn.commit()
+        except Exception as exc:
+            logging.warning("Failed ensuring resolved_track_cache table: %s", exc)
+
+    def _delete_resolved_links_entries(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        try:
+            with self._resolved_links_db_connect() as conn:
+                conn.executemany(
+                    "DELETE FROM resolved_track_cache WHERE cache_key = ?",
+                    [(key,) for key in keys],
+                )
+                conn.commit()
+        except Exception as exc:
+            logging.warning("Failed deleting resolved link cache entries: %s", exc)
+
+    def _upsert_resolved_links_entries(self, rows: list[tuple[str, str, int]]) -> None:
+        if not rows:
+            return
+        try:
+            with self._resolved_links_db_connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO resolved_track_cache (cache_key, uri, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+        except Exception as exc:
+            logging.warning("Failed writing resolved link cache entries: %s", exc)
+
     def _load_resolved_links_cache(self) -> dict[str, dict[str, object]]:
         if not self._resolved_links_cache_enabled:
             return {}
 
-        if not os.path.exists(self._resolved_links_cache_file):
-            return {}
-
-        try:
-            with open(self._resolved_links_cache_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception as exc:
-            logging.warning("Failed reading resolved links cache: %s", exc)
-            return {}
-
-        if not isinstance(raw, dict):
-            return {}
-
         parsed: dict[str, dict[str, object]] = {}
         now = int(time.time())
-        changed = False
+        stale_keys: list[str] = []
+        try:
+            with self._resolved_links_db_connect() as conn:
+                rows = conn.execute("SELECT cache_key, uri, updated_at FROM resolved_track_cache").fetchall()
+        except Exception as exc:
+            logging.warning("Failed reading resolved link cache from SQLite: %s", exc)
+            return {}
 
-        for raw_key, raw_val in raw.items():
-            key = self._normalize_cache_key(raw_key)
-            if not key:
-                changed = True
-                continue
-
-            uri = ""
-            updated_at = now
-
-            if isinstance(raw_val, str):
-                uri = raw_val.strip()
+        for row in rows:
+            key = self._normalize_cache_key(str(row["cache_key"] or ""))
+            uri = str(row["uri"] or "").strip()
+            try:
+                updated_at = int(row["updated_at"] or now)
+            except (TypeError, ValueError):
                 updated_at = now
-                changed = True
-            elif isinstance(raw_val, dict):
-                uri = str(raw_val.get("uri", "")).strip()
-                try:
-                    updated_at = int(raw_val.get("updated_at", now))
-                except (TypeError, ValueError):
-                    updated_at = now
-                    changed = True
-            else:
-                changed = True
+            if not key or not uri:
+                if key:
+                    stale_keys.append(key)
                 continue
-
-            if not uri:
-                changed = True
-                continue
-
             if self._resolved_links_cache_ttl_seconds > 0 and (now - updated_at) > self._resolved_links_cache_ttl_seconds:
-                changed = True
+                stale_keys.append(key)
                 continue
-
             parsed[key] = {"uri": uri, "updated_at": updated_at}
-
-        if changed:
-            self._resolved_links_cache = parsed
-            self._save_resolved_links_cache()
+        if stale_keys:
+            self._delete_resolved_links_entries(stale_keys)
 
         return parsed
 
     def _save_resolved_links_cache(self) -> None:
         if not self._resolved_links_cache_enabled:
             return
-
-        try:
-            os.makedirs(os.path.dirname(self._resolved_links_cache_file), exist_ok=True)
-            with open(self._resolved_links_cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._resolved_links_cache, f, indent=2)
-        except Exception as exc:
-            logging.warning("Failed writing resolved links cache: %s", exc)
+        rows: list[tuple[str, str, int]] = []
+        for key, entry in self._resolved_links_cache.items():
+            if not isinstance(entry, dict):
+                continue
+            uri = str(entry.get("uri", "")).strip()
+            if not uri:
+                continue
+            try:
+                updated_at = int(entry.get("updated_at", int(time.time())))
+            except (TypeError, ValueError):
+                updated_at = int(time.time())
+            rows.append((key, uri, updated_at))
+        self._upsert_resolved_links_entries(rows)
 
     def _get_cached_resolved_link(self, keys: list[str]) -> Optional[str]:
         if not self._resolved_links_cache_enabled or not keys:
             return None
 
         now = int(time.time())
-        changed = False
+        stale_keys: list[str] = []
 
         for key in keys:
             entry = self._resolved_links_cache.get(key)
@@ -306,20 +346,20 @@ class Music(commands.Cog):
 
             if not uri:
                 self._resolved_links_cache.pop(key, None)
-                changed = True
+                stale_keys.append(key)
                 continue
 
             if self._resolved_links_cache_ttl_seconds > 0 and updated_at and (now - updated_at) > self._resolved_links_cache_ttl_seconds:
                 self._resolved_links_cache.pop(key, None)
-                changed = True
+                stale_keys.append(key)
                 continue
 
-            if changed:
-                self._save_resolved_links_cache()
+            if stale_keys:
+                self._delete_resolved_links_entries(stale_keys)
             return uri
 
-        if changed:
-            self._save_resolved_links_cache()
+        if stale_keys:
+            self._delete_resolved_links_entries(stale_keys)
         return None
 
     def _set_cached_resolved_link(self, keys: list[str], uri: Optional[str]) -> None:
@@ -330,33 +370,31 @@ class Music(commands.Cog):
         if not uri:
             return
 
+        now = int(time.time())
         entry = {
             "uri": uri,
-            "updated_at": int(time.time()),
+            "updated_at": now,
         }
-        changed = False
-
+        rows: list[tuple[str, str, int]] = []
         for key in keys:
             existing = self._resolved_links_cache.get(key)
             if not isinstance(existing, dict) or existing.get("uri") != uri:
                 self._resolved_links_cache[key] = entry
-                changed = True
-
-        if changed:
-            self._save_resolved_links_cache()
+                rows.append((key, uri, now))
+        if rows:
+            self._upsert_resolved_links_entries(rows)
 
     def _remove_cached_resolved_link(self, keys: list[str]) -> None:
         if not self._resolved_links_cache_enabled or not keys:
             return
 
-        changed = False
+        deleted_keys: list[str] = []
         for key in keys:
             if key in self._resolved_links_cache:
                 self._resolved_links_cache.pop(key, None)
-                changed = True
-
-        if changed:
-            self._save_resolved_links_cache()
+                deleted_keys.append(key)
+        if deleted_keys:
+            self._delete_resolved_links_entries(deleted_keys)
 
     async def _open_dashboard(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
@@ -762,13 +800,19 @@ class Music(commands.Cog):
         active_spacer_row = f" {_center_visible(' ', content_width)} "
 
         # Add breathing room around the full active lyric block without splitting
-        # wrapped highlighted rows.
+        # wrapped highlighted rows.  Always insert spacers (even when no line is
+        # active) so the layout stays stable across index transitions.
         active_indices = [i for i, (_, is_active_row) in enumerate(block_lines) if is_active_row]
         if active_indices:
             first_active = active_indices[0]
             last_active = active_indices[-1]
             block_lines.insert(first_active, (active_spacer_row, False))
             block_lines.insert(last_active + 2, (active_spacer_row, False))
+        elif block_lines:
+            # No active line (before first lyric); insert spacers around the
+            # first row so the viewport geometry matches the highlighted state.
+            block_lines.insert(0, (active_spacer_row, False))
+            block_lines.insert(2, (active_spacer_row, False))
 
         if len(block_lines) > target_rows:
             active_row_idx = next((i for i, (_, is_active_row) in enumerate(block_lines) if is_active_row), None)
@@ -925,6 +969,7 @@ class Music(commands.Cog):
                     artist=result.artist,
                     anchor_ms=anchor_ms,
                     anchor_at=anchor_at,
+                    initial_index=active_index,
                 )
             )
             self._live_lyrics_tasks[id(sent)] = task
@@ -966,8 +1011,9 @@ class Music(commands.Cog):
         artist: Optional[str],
         anchor_ms: int,
         anchor_at: float,
+        initial_index: int = -2,
     ) -> None:
-        last_idx = -2
+        last_idx = initial_index
         poll_interval = 0.4
         try:
             while True:
@@ -986,6 +1032,10 @@ class Music(commands.Cog):
                     anchor_at=anchor_at,
                 )
                 idx = self._find_active_synced_index(lines, position_ms)
+                # Clamp forward jumps to avoid jarring viewport shifts when
+                # Lavalink reports a transient position spike.
+                if last_idx >= 0 and idx > last_idx + 3:
+                    idx = last_idx + 1
                 if idx != last_idx:
                     last_idx = idx
                     embed = self._build_live_lyrics_embed(
