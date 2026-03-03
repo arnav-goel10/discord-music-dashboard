@@ -11,6 +11,8 @@ import time
 import datetime
 from typing import cast, Optional
 
+from utils.patched_player import DAVECompatiblePlayer
+
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 
 class Music(commands.Cog):
@@ -218,7 +220,7 @@ class Music(commands.Cog):
 
         if not player:
             try:
-                player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+                player = await interaction.user.voice.channel.connect(cls=DAVECompatiblePlayer)
                 created_player = True
             except AttributeError:
                 await self._reply(interaction, "Join a voice channel first, then run `/music`.", ephemeral=True)
@@ -229,7 +231,7 @@ class Music(commands.Cog):
 
         if created_player:
             try:
-                await player.set_volume(30)
+                await player.set_volume(15)
             except Exception as exc:
                 logging.debug("Failed to set default volume on new dashboard player: %s", exc)
 
@@ -584,7 +586,7 @@ class Music(commands.Cog):
             return "Resumed the music."
 
         if not player.queue.is_empty:
-            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
             return "No active track was playing, so I started the next song in queue."
 
         return "There is no paused track and the queue is empty."
@@ -678,6 +680,10 @@ class Music(commands.Cog):
             or ""
         )
 
+    @staticmethod
+    def _is_stale_lavalink_session_error(exc: Exception) -> bool:
+        return isinstance(exc, wavelink.LavalinkException) and getattr(exc, "status", None) == 404
+
     async def _force_start_next_from_queue(self, player: wavelink.Player) -> bool:
         if player.queue.is_empty:
             return False
@@ -686,7 +692,7 @@ class Music(commands.Cog):
         await player.play(
             next_track,
             replace=True,
-            volume=int(getattr(player, "volume", 30) or 30),
+            volume=int(getattr(player, "volume", 15)),
         )
         return True
 
@@ -712,6 +718,9 @@ class Music(commands.Cog):
                 try:
                     await player.skip(force=True)
                 except Exception as exc:
+                    if self._is_stale_lavalink_session_error(exc):
+                        logging.warning("Skip aborted due to stale Lavalink session: %s", exc)
+                        return "Audio session expired. Use `/music` to re-open the player."
                     logging.warning("Skip failed, attempting queue fallback: %s", exc)
 
                 # Give Lavalink a brief moment to transition track state.
@@ -727,7 +736,15 @@ class Music(commands.Cog):
                 await _ensure_not_paused()
                 return "Skipped the current song."
 
-            if await self._force_start_next_from_queue(player):
+            try:
+                force_started = await self._force_start_next_from_queue(player)
+            except Exception as exc:
+                if self._is_stale_lavalink_session_error(exc):
+                    logging.warning("Queue fallback aborted due to stale Lavalink session: %s", exc)
+                    return "Audio session expired. Use `/music` to re-open the player."
+                raise
+
+            if force_started:
                 await _ensure_not_paused()
                 self._manual_advance_until[self._player_scope_id(player)] = time.time() + 2.0
                 return "Skipped to the next queued song."
@@ -809,7 +826,33 @@ class Music(commands.Cog):
         logging.error("App command error in /%s: %s", command_name, error, exc_info=error)
         message = f"An error occurred: {error}"
         await self._reply(interaction, message, ephemeral=True)
-        
+
+    @commands.Cog.listener()
+    async def on_wavelink_websocket_closed(self, payload: wavelink.WebsocketClosedEventPayload):
+        player: Optional[wavelink.Player] = payload.player
+        guild_id = player.guild.id if player and player.guild else "unknown"
+        logging.warning(
+            "Discord voice websocket closed for guild=%s code=%s by_remote=%s reason=%s",
+            guild_id,
+            payload.code,
+            payload.by_remote,
+            payload.reason or "",
+        )
+
+        if not player or not player.guild:
+            return
+
+        # DAVE-related close codes can require a fresh VOICE_STATE re-dispatch.
+        if payload.code not in {1006, 4014, 4015, 4017}:
+            return
+
+        try:
+            channel = getattr(player, "channel", None)
+            if channel is not None:
+                await player.guild.change_voice_state(channel=channel)
+        except Exception as exc:
+            logging.debug("Failed to re-dispatch guild voice state after websocket close: %s", exc)
+
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
         print(f"Wavelink Node connected: {payload.node!r} | Resumed: {payload.resumed}")
@@ -954,7 +997,7 @@ class Music(commands.Cog):
                 await player.play(
                     next_track,
                     replace=True,
-                    volume=int(getattr(player, "volume", 30) or 30),
+                    volume=int(getattr(player, "volume", 15)),
                 )
             except Exception as exc:
                 logging.error("Failed to continue playback after track exception: %s", exc)
@@ -1007,11 +1050,24 @@ class Music(commands.Cog):
             await self._reply(interaction, "I'm not connected to voice.", ephemeral=True)
             return
 
+        ui_message = getattr(player, "ui_message", None)
+        if ui_message:
+            try:
+                await ui_message.delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as exc:
+                logging.debug("Could not delete dashboard message on stop: %s", exc)
+            finally:
+                player.ui_message = None
+
         if getattr(player, "ui_view", None):
             try:
                 player.ui_view.stop()
             except Exception:
                 pass
+            finally:
+                player.ui_view = None
 
         await self._cancel_playlist_loading(player)
         self._cleanup_player_scope(player)
@@ -1022,7 +1078,7 @@ class Music(commands.Cog):
             await self._reply(interaction, f"Failed to disconnect cleanly: {exc}", ephemeral=True)
             return
 
-        await self._reply(interaction, "Stopped playback and disconnected from voice.")
+        await self._reply(interaction, "Stopped playback and disconnected from voice.", ephemeral=True)
 
     async def _execute_play(
         self,
@@ -1046,7 +1102,7 @@ class Music(commands.Cog):
 
         if not player:
             try:
-                player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+                player = await interaction.user.voice.channel.connect(cls=DAVECompatiblePlayer)
                 created_player = True
             except AttributeError:
                 await self._reply(interaction, "Please join a voice channel first!", ephemeral=True)
@@ -1057,7 +1113,7 @@ class Music(commands.Cog):
 
         if created_player:
             try:
-                await player.set_volume(30)
+                await player.set_volume(15)
             except Exception as exc:
                 logging.debug("Failed to set default volume on new playback player: %s", exc)
 
@@ -1183,7 +1239,7 @@ class Music(commands.Cog):
                         )
 
                         if not player.playing and not player.queue.is_empty:
-                            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+                            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
 
                         if getattr(player, "ui_view", None):
                             await player.ui_view.update_player_message()
@@ -1203,7 +1259,7 @@ class Music(commands.Cog):
                         )
 
                         if not player.playing and not player.queue.is_empty:
-                            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+                            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
                         self._clear_queue_busy(player)
                         return
 
@@ -1255,7 +1311,7 @@ class Music(commands.Cog):
                     await interaction.followup.send(success_status, ephemeral=True)
                 
                 if not player.playing:
-                    await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+                    await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
 
                 if not tracks:
                     self._clear_queue_busy(player)
@@ -1372,7 +1428,7 @@ class Music(commands.Cog):
                 await interaction.followup.send(msg)
 
                 if not player.playing:
-                    await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+                    await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
                 
                 if getattr(player, "ui_view", None):
                     await player.ui_view.update_player_message()
@@ -1428,7 +1484,7 @@ class Music(commands.Cog):
                 await interaction.followup.send(msg)
 
             if not player.playing:
-                await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+                await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
                 
             if getattr(player, "ui_view", None):
                 await player.ui_view.update_player_message()

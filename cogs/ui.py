@@ -487,11 +487,11 @@ class SavedPlaylistManagerView(discord.ui.View):
             return
         await interaction.response.send_modal(EditSavedPlaylistModal(self, self.selected_index))
 
-    @discord.ui.button(style=discord.ButtonStyle.primary, emoji=None, label="Save", row=2)
+    @discord.ui.button(style=discord.ButtonStyle.primary, emoji="💾", label="", row=2)
     async def save_playlist(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(SavePlaylistModal(parent_view=self))
 
-    @discord.ui.button(style=discord.ButtonStyle.danger, emoji=None, label="Delete", row=2)
+    @discord.ui.button(style=discord.ButtonStyle.danger, emoji="🗑", label="", row=2)
     async def delete_selected(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.selected_index < 0 or self.selected_index >= len(self.playlists):
             await interaction.response.send_message("No saved playlist selected.", ephemeral=True)
@@ -520,7 +520,7 @@ class VolumeModal(discord.ui.Modal, title="Set Volume"):
         max_length=3,
     )
 
-    def __init__(self, parent_view: "SpotifyUI", *, current_volume: int = 30):
+    def __init__(self, parent_view: "SpotifyUI", *, current_volume: int = 15):
         super().__init__()
         self.parent_view = parent_view
         safe_volume = max(0, min(100, int(current_volume)))
@@ -1087,13 +1087,13 @@ class SpotifyUI(_DashboardBaseView):
             style=discord.ButtonStyle.secondary, emoji=None, label="Q", row=1
         )
         self.manage_lists = discord.ui.Button(
-            style=discord.ButtonStyle.primary, emoji=None, label="Save", row=1
+            style=discord.ButtonStyle.primary, emoji="💾", label="", row=1
         )
         self.volume_set = discord.ui.Button(
             style=discord.ButtonStyle.secondary, emoji="🔊", label="", row=0
         )
         self.filter_popup = discord.ui.Button(
-            style=discord.ButtonStyle.secondary, emoji="🎛", label="", row=1
+            style=discord.ButtonStyle.secondary, emoji=None, label="Fx", row=1
         )
 
         self.previous_track.callback = self._manual_previous_track
@@ -1331,7 +1331,7 @@ class SpotifyUI(_DashboardBaseView):
             track_key,
             position_bucket,
             bool(getattr(self.player, "paused", False)),
-            int(getattr(self.player, "volume", 30) or 30),
+            int(getattr(self.player, "volume", 15)),
             int(self.player.queue.count),
             str(self.player.queue.mode),
             self._active_filter_name(),
@@ -1343,7 +1343,10 @@ class SpotifyUI(_DashboardBaseView):
                 await asyncio.sleep(self._refresh_interval)
                 if not self.message:
                     continue
-                await self.update_player_message()
+                try:
+                    await self.update_player_message()
+                except Exception as exc:
+                    logging.debug("Dashboard auto-refresh error (continuing): %s", exc)
         except asyncio.CancelledError:
             return
 
@@ -1391,12 +1394,18 @@ class SpotifyUI(_DashboardBaseView):
         return False
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
-        logging.exception("Dashboard interaction error on %s: %s", type(item).__name__, error)
+        if isinstance(error, wavelink.LavalinkException) and error.status == 404:
+            # Session expired or websocket desynced; player needs a fresh voice handshake.
+            logging.warning("Dashboard: stale Lavalink session on %s (404). Player needs to be re-opened.", type(item).__name__)
+            msg = "The audio session expired. Please use `/music` to re-open the player."
+        else:
+            logging.exception("Dashboard interaction error on %s: %s", type(item).__name__, error)
+            msg = "That control failed. Please try again."
         try:
             if interaction.response.is_done():
-                await interaction.followup.send("That control failed. Please try again.", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             else:
-                await interaction.response.send_message("That control failed. Please try again.", ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
         except Exception:
             pass
 
@@ -1436,36 +1445,7 @@ class SpotifyUI(_DashboardBaseView):
         if preset in preset_names:
             return preset_names[preset]
 
-        payload = self.player.filters()
-        if not isinstance(payload, dict):
-            return "None"
-
-        names: list[str] = []
-
-        eq = payload.get("equalizer")
-        if isinstance(eq, list):
-            has_eq = any(
-                isinstance(band, dict) and abs(float(band.get("gain", 0.0))) > 0.0001
-                for band in eq
-            )
-            if has_eq:
-                names.append("EQ")
-
-        pretty_names = {
-            "timescale": "Timescale",
-            "rotation": "Rotation",
-            "tremolo": "Tremolo",
-            "vibrato": "Vibrato",
-            "karaoke": "Karaoke",
-            "distortion": "Distortion",
-            "lowPass": "LowPass",
-            "channelMix": "ChannelMix",
-        }
-        for key in ("timescale", "rotation", "tremolo", "vibrato", "karaoke", "distortion", "lowPass", "channelMix"):
-            if key in payload:
-                names.append(pretty_names.get(key, key))
-
-        return "Custom" if names else "None"
+        return "None"
 
     def _active_filter_value(self) -> str:
         value = str(getattr(self.player, "ui_filter_preset", "none") or "none")
@@ -1531,6 +1511,7 @@ class SpotifyUI(_DashboardBaseView):
     async def previous_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
+            await interaction.response.send_message("No active player.", ephemeral=True)
             return
         await interaction.response.defer()
         if player.current:
@@ -1541,6 +1522,7 @@ class SpotifyUI(_DashboardBaseView):
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
+            await interaction.response.send_message("No active player.", ephemeral=True)
             return
         await interaction.response.defer()
         if player.current:
@@ -1549,7 +1531,7 @@ class SpotifyUI(_DashboardBaseView):
             else:
                 await player.pause(True)
         elif not player.queue.is_empty:
-            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 30) or 30))
+            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
             if player.paused:
                 try:
                     await player.pause(False)
@@ -1562,6 +1544,7 @@ class SpotifyUI(_DashboardBaseView):
     async def skip_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
+            await interaction.response.send_message("No active player.", ephemeral=True)
             return
         music_cog = _get_music_cog(interaction)
         if not music_cog or not hasattr(music_cog, "_skip_or_start_next"):
@@ -1581,6 +1564,8 @@ class SpotifyUI(_DashboardBaseView):
         await interaction.response.defer()
         try:
             await music_cog._skip_or_start_next(player)
+        except wavelink.LavalinkException:
+            raise  # Let on_error handle stale-session 404s with a proper message.
         except Exception as exc:
             logging.warning("Dashboard skip failed unexpectedly: %s", exc)
         await asyncio.sleep(0.15)
@@ -1590,6 +1575,7 @@ class SpotifyUI(_DashboardBaseView):
     async def shuffle_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
+            await interaction.response.send_message("No active player.", ephemeral=True)
             return
         music_cog = _get_music_cog(interaction)
         block_reason = None
@@ -1611,6 +1597,7 @@ class SpotifyUI(_DashboardBaseView):
     async def toggle_loop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = await self._require_live_player(interaction)
         if not player:
+            await interaction.response.send_message("No active player.", ephemeral=True)
             return
         await interaction.response.defer()
         if player.queue.mode == wavelink.QueueMode.normal:
@@ -1637,7 +1624,7 @@ class SpotifyUI(_DashboardBaseView):
         except discord.NotFound:
             pass
 
-    @discord.ui.button(style=discord.ButtonStyle.primary, emoji=None, label="Save", row=1)
+    @discord.ui.button(style=discord.ButtonStyle.primary, emoji="💾", label="", row=1)
     async def manage_lists(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         view = SavedPlaylistManagerView(self)
         await interaction.response.send_message(
@@ -1653,10 +1640,10 @@ class SpotifyUI(_DashboardBaseView):
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🔊", label="", row=0)
     async def volume_set(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self._live_player(interaction)
-        current_volume = int(getattr(player, "volume", 30) or 30) if player else 30
+        current_volume = int(getattr(player, "volume", 15)) if player else 15
         await interaction.response.send_modal(VolumeModal(self, current_volume=current_volume))
 
-    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🎛", label="", row=1)
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="Fx", row=1)
     async def filter_popup(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         view = AudioFilterPickerView(self)
         await interaction.response.send_message(
