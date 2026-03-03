@@ -9,13 +9,89 @@ import re
 import json
 import time
 import datetime
-from typing import cast, Optional
+import difflib
+import math
+import textwrap
+from typing import cast, Optional, Any
 
 from utils.patched_player import DAVECompatiblePlayer
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 
+
+class LyricsPaginatorView(discord.ui.View):
+    def __init__(self, embeds: list[discord.Embed], *, owner_id: int):
+        super().__init__(timeout=180)
+        self.embeds = embeds
+        self.owner_id = int(owner_id)
+        self.index = 0
+        self.message: Optional[discord.Message] = None
+        self._sync()
+
+    def _sync(self) -> None:
+        has_many = len(self.embeds) > 1
+        self.prev_page.disabled = not has_many or self.index <= 0
+        self.next_page.disabled = not has_many or self.index >= len(self.embeds) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(getattr(interaction.user, "id", 0)) == self.owner_id:
+            return True
+        try:
+            await interaction.response.send_message(
+                "Only the person who requested these lyrics can use this paginator.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+        return False
+
+    async def on_timeout(self) -> None:
+        self.prev_page.disabled = True
+        self.next_page.disabled = True
+        self.close.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary, label="Prev")
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.index > 0:
+            self.index -= 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary, label="Next")
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.index < len(self.embeds) - 1:
+            self.index += 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
+
+    @discord.ui.button(style=discord.ButtonStyle.danger, label="Close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        try:
+            await interaction.response.defer()
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+
+
 class Music(commands.Cog):
+    _TRACK_VERSION_PATTERNS: dict[str, tuple[str, ...]] = {
+        "live": (r"\blive\b", r"\bunplugged\b", r"\bsession\b"),
+        "cover": (r"\bcover\b",),
+        "karaoke": (r"\bkaraoke\b",),
+        "instrumental": (r"\binstrumental\b",),
+        "acoustic": (r"\bacoustic\b", r"\bstripped\b"),
+        "remix": (r"\bremix\b", r"\brework\b", r"\bvip\b", r"\bedit\b", r"\boriginal mix\b", r"\bextended mix\b"),
+        "nightcore": (r"\bnightcore\b",),
+        "slowed": (r"\bslowed\b", r"\breverb\b", r"\bchopped\b", r"\bsped up\b"),
+        "tiktok": (r"\btiktok\b",),
+    }
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._player_action_locks: dict[int, asyncio.Lock] = {}
@@ -35,6 +111,71 @@ class Music(commands.Cog):
         except ValueError:
             self._resolved_links_cache_ttl_seconds = 2_592_000
         self._resolved_links_cache = self._load_resolved_links_cache()
+        self._resolver_rrf_k = self._env_int("TRACK_RESOLVER_RRF_K", 20, minimum=1)
+        self._resolver_rrf_scale = self._env_float("TRACK_RESOLVER_RRF_SCALE", 320.0, minimum=0.0)
+        self._resolver_per_query_limit = self._env_int("TRACK_RESOLVER_PER_QUERY_LIMIT", 12, minimum=1)
+        self._resolver_max_merged_candidates = self._env_int("TRACK_RESOLVER_MAX_CANDIDATES", 60, minimum=15)
+        self._resolver_min_cache_score = self._env_float("TRACK_RESOLVER_MIN_CACHE_SCORE", 58.0)
+        self._resolver_min_cache_margin = self._env_float("TRACK_RESOLVER_MIN_CACHE_MARGIN", 5.0, minimum=0.0)
+        self._ml_reranker_enabled = self._env_bool("TRACK_RESOLVER_ML_RERANK_ENABLED", False)
+        self._ml_reranker_model_name = os.getenv(
+            "TRACK_RESOLVER_ML_RERANK_MODEL",
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        ).strip() or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        self._ml_reranker_weight = self._env_float("TRACK_RESOLVER_ML_RERANK_WEIGHT", 22.0, minimum=0.0)
+        self._ml_reranker_max_candidates = self._env_int(
+            "TRACK_RESOLVER_ML_MAX_CANDIDATES",
+            30,
+            minimum=5,
+            maximum=60,
+        )
+        self._ml_reranker: Any = None
+        self._ml_reranker_load_failed = False
+        self._ml_reranker_lock = asyncio.Lock()
+        self._live_lyrics_tasks: dict[int, asyncio.Task] = {}
+
+    def cog_unload(self):
+        for task in list(self._live_lyrics_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._live_lyrics_tasks.clear()
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _env_int(
+        name: str,
+        default: int,
+        *,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> int:
+        raw = (os.getenv(name) or "").strip()
+        try:
+            value = int(raw) if raw else default
+        except ValueError:
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    @staticmethod
+    def _env_float(name: str, default: float, *, minimum: Optional[float] = None) -> float:
+        raw = (os.getenv(name) or "").strip()
+        try:
+            value = float(raw) if raw else default
+        except ValueError:
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
 
     @staticmethod
     def _normalize_cache_key(raw: Optional[str]) -> str:
@@ -48,6 +189,8 @@ class Music(commands.Cog):
         query: str,
         title: Optional[str] = None,
         artist: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        isrc: Optional[str] = None,
     ) -> list[str]:
         keys: list[str] = []
 
@@ -60,6 +203,14 @@ class Music(commands.Cog):
         if title and artist:
             add(f"{title} - {artist}")
             add(f"{title} {artist}")
+        if title:
+            add(title)
+        if artist:
+            add(artist)
+        if duration_ms and int(duration_ms) > 0:
+            add(f"duration:{int(duration_ms) // 1000}")
+        if isrc:
+            add(f"isrc:{str(isrc).strip().upper()}")
 
         return keys
 
@@ -314,6 +465,548 @@ class Music(commands.Cog):
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
     @staticmethod
+    def _split_lyrics_query(raw: str) -> tuple[str, Optional[str]]:
+        query = " ".join(str(raw or "").split()).strip()
+        if not query:
+            return "", None
+
+        separators = [" - ", " — ", " by "]
+        for separator in separators:
+            if separator in query:
+                left, right = query.split(separator, 1)
+                title = left.strip()
+                artist = right.strip()
+                if title and artist:
+                    return title, artist
+        return query, None
+
+    @staticmethod
+    def _extract_spotify_track_id(*values: Optional[str]) -> Optional[str]:
+        for value in values:
+            if not value:
+                continue
+            text = str(value).strip()
+            match = re.search(r"(?:open\.spotify\.com/track/|spotify:track:)([A-Za-z0-9]{22})", text)
+            if match:
+                return match.group(1)
+            if re.fullmatch(r"[A-Za-z0-9]{22}", text):
+                return text
+        return None
+
+    @staticmethod
+    def _extract_track_album_name(track: Any) -> Optional[str]:
+        source_album = getattr(track, "_source_album", None)
+        if isinstance(source_album, str) and source_album.strip():
+            return source_album.strip()
+
+        album = getattr(track, "album", None)
+
+        if isinstance(album, str) and album.strip():
+            return album.strip()
+
+        if isinstance(album, dict):
+            for key in ("name", "title"):
+                value = album.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        album_name = getattr(album, "name", None)
+        if isinstance(album_name, str) and album_name.strip():
+            return album_name.strip()
+
+        extras = getattr(track, "extras", None)
+        if isinstance(extras, dict):
+            for key in ("album", "album_name", "spotify_album"):
+                value = extras.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        else:
+            for key in ("album", "album_name", "spotify_album"):
+                value = getattr(extras, key, None)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        return None
+
+    @staticmethod
+    def _extract_track_spotify_id(track: Any) -> Optional[str]:
+        annotated_id = Music._extract_spotify_track_id(getattr(track, "_spotify_track_id", None))
+        if annotated_id:
+            return annotated_id
+
+        direct = Music._extract_spotify_track_id(
+            getattr(track, "uri", None),
+            getattr(track, "identifier", None),
+        )
+        if direct:
+            return direct
+
+        source_raw = str(getattr(track, "source", "") or getattr(track, "source_name", "")).strip().lower()
+        identifier = str(getattr(track, "identifier", "") or "").strip()
+        if "spotify" in source_raw and re.fullmatch(r"[A-Za-z0-9]{22}", identifier):
+            return identifier
+
+        extras = getattr(track, "extras", None)
+        if isinstance(extras, dict):
+            return Music._extract_spotify_track_id(
+                extras.get("spotify_track_id"),
+                extras.get("spotify_id"),
+                extras.get("track_id"),
+            )
+        return Music._extract_spotify_track_id(
+            getattr(extras, "spotify_track_id", None),
+            getattr(extras, "spotify_id", None),
+            getattr(extras, "track_id", None),
+        )
+
+    @staticmethod
+    def _annotate_playable_metadata(
+        playable: Optional[wavelink.Playable],
+        *,
+        album: Optional[str] = None,
+        spotify_track_id: Optional[str] = None,
+    ) -> None:
+        if not playable:
+            return
+        if isinstance(album, str) and album.strip():
+            try:
+                setattr(playable, "_source_album", album.strip())
+            except Exception:
+                pass
+        if isinstance(spotify_track_id, str) and spotify_track_id.strip():
+            try:
+                setattr(playable, "_spotify_track_id", spotify_track_id.strip())
+            except Exception:
+                pass
+
+    @staticmethod
+    def _split_text_pages(text: str, max_chars: int = 3500) -> list[str]:
+        if not text:
+            return []
+        max_chars = max(800, min(3900, int(max_chars)))
+        lines = text.splitlines()
+        pages: list[str] = []
+        current: list[str] = []
+        current_len = 0
+
+        for raw_line in lines:
+            line = raw_line.rstrip()
+            extra = len(line) + 1
+            if current and current_len + extra > max_chars:
+                pages.append("\n".join(current).strip())
+                current = [line]
+                current_len = len(line) + 1
+            else:
+                current.append(line)
+                current_len += extra
+
+        if current:
+            pages.append("\n".join(current).strip())
+
+        if not pages:
+            pages = [text[:max_chars]]
+        return pages
+
+    @staticmethod
+    def _parse_synced_lyrics_lines(raw: Optional[str]) -> list[tuple[int, str]]:
+        text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            return []
+
+        parsed: list[tuple[int, str]] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            tags = re.findall(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]", line)
+            if not tags:
+                continue
+            lyric_text = re.sub(r"(?:\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\])+", "", line).strip()
+            if not lyric_text:
+                continue
+
+            for mm_raw, ss_raw, ms_raw in tags:
+                mm = int(mm_raw)
+                ss = int(ss_raw)
+                frac = (ms_raw or "").ljust(3, "0")[:3]
+                ms = int(frac) if frac else 0
+                start_ms = (mm * 60 + ss) * 1000 + ms
+                parsed.append((max(0, start_ms), lyric_text))
+
+        parsed.sort(key=lambda item: item[0])
+        deduped: list[tuple[int, str]] = []
+        for start_ms, line in parsed:
+            if deduped and deduped[-1][0] == start_ms and deduped[-1][1] == line:
+                continue
+            deduped.append((start_ms, line))
+        return deduped
+
+    @staticmethod
+    def _find_active_synced_index(lines: list[tuple[int, str]], position_ms: int) -> int:
+        if not lines:
+            return -1
+        idx = -1
+        for i, (start_ms, _) in enumerate(lines):
+            if start_ms <= position_ms:
+                idx = i
+            else:
+                break
+        return idx
+
+    @staticmethod
+    def _display_player_position_ms(player: Optional[wavelink.Player], *, anchor_ms: int, anchor_at: float) -> int:
+        if not player:
+            return max(0, anchor_ms)
+        base = int(getattr(player, "position", 0) or 0)
+        if base > anchor_ms:
+            return max(0, base)
+        if bool(getattr(player, "paused", False)) or not bool(getattr(player, "playing", False)):
+            return max(0, anchor_ms)
+        elapsed = int((time.monotonic() - anchor_at) * 1000)
+        return max(0, anchor_ms + elapsed)
+
+    def _build_live_lyrics_embed(
+        self,
+        *,
+        title: str,
+        artist: Optional[str],
+        lines: list[tuple[int, str]],
+        active_index: int,
+    ) -> discord.Embed:
+        safe_title = discord.utils.escape_markdown(title or "Unknown Title", as_needed=True)
+        safe_artist = discord.utils.escape_markdown(artist or "Unknown Artist", as_needed=True)
+        heading = f"{safe_title} - {safe_artist}" if safe_artist else safe_title
+
+        context_radius = 5
+        window_size = 15
+        start = max(0, active_index - context_radius)
+        end = min(len(lines), active_index + context_radius + 1) if active_index >= 0 else min(len(lines), window_size)
+
+        rendered: list[tuple[bool, str]] = []
+        for idx in range(start, end):
+            _, line = lines[idx]
+            text = discord.utils.escape_markdown(line, as_needed=True)
+            text = " ".join(text.split())
+            if idx == active_index:
+                rendered.append((True, f"▶ {text} ◀"))
+            else:
+                rendered.append((False, text))
+
+        if not rendered:
+            rendered = [(False, "No synced line available yet")]
+
+        # Embed markdown does not support real alignment/font-size controls.
+        # Use a fixed-width ANSI block so layout stays stable and only the active line is colored.
+        # Keep fixed width below Discord client wrap threshold to prevent
+        # visual reflow/splitting of arrows and centered rows.
+        width = 57
+        content_width = width - 2
+        reset = "\u001b[0m"
+        active_color = "\u001b[1;36m"
+        pad_char = "\u2007"  # Figure space: visually stable in Discord code blocks.
+
+        def _clip_ellipsis(text: str, limit: int) -> str:
+            if len(text) <= limit:
+                return text
+            if limit <= 1:
+                return text[:limit]
+            return text[: limit - 1].rstrip() + "…"
+
+        def _wrap_clean(text: str, limit: int) -> list[str]:
+            if limit <= 1:
+                return [text[:1]] if text else [""]
+            wrapped = textwrap.wrap(
+                text,
+                width=limit,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            return wrapped or [""]
+
+        def _center_visible(text: str, target: int) -> str:
+            if len(text) >= target:
+                return text
+            total_pad = target - len(text)
+            left = total_pad // 2
+            right = total_pad - left
+            return f"{pad_char * left}{text}{pad_char * right}"
+
+        block_lines: list[tuple[str, bool]] = []
+        for is_active, line_text in rendered:
+            if is_active:
+                # Keep arrows fixed in left/right columns for visual stability.
+                # Wrap long active lines cleanly instead of overflowing.
+                inner = content_width - 4  # "▶ " + text + " ◀"
+                base = line_text.replace("▶ ", "", 1)
+                if base.endswith(" ◀"):
+                    base = base[:-2]
+                chunks = _wrap_clean(base.strip(), inner)
+                for chunk_idx, chunk in enumerate(chunks):
+                    centered_inner = _center_visible(chunk, inner)
+                    if chunk_idx == 0:
+                        fixed = f"▶ {centered_inner} ◀"
+                    else:
+                        fixed = f"  {centered_inner}  "
+                    block_lines.append((f"{active_color} {fixed} {reset}", True))
+            else:
+                # Wrap long context lines cleanly and center each wrapped row.
+                chunks = _wrap_clean(line_text, content_width)
+                for chunk in chunks:
+                    centered = _center_visible(chunk, content_width)
+                    block_lines.append((f" {centered} ", False))
+
+        # Keep a fixed-height viewport so embed size does not jump.
+        target_rows = window_size
+        blank_row = f" {_center_visible('', content_width)} "
+        active_spacer_row = f" {_center_visible(' ', content_width)} "
+
+        # Add breathing room around the full active lyric block without splitting
+        # wrapped highlighted rows.
+        active_indices = [i for i, (_, is_active_row) in enumerate(block_lines) if is_active_row]
+        if active_indices:
+            first_active = active_indices[0]
+            last_active = active_indices[-1]
+            block_lines.insert(first_active, (active_spacer_row, False))
+            block_lines.insert(last_active + 2, (active_spacer_row, False))
+
+        if len(block_lines) > target_rows:
+            active_row_idx = next((i for i, (_, is_active_row) in enumerate(block_lines) if is_active_row), None)
+            if active_row_idx is None:
+                start_row = 0
+            else:
+                start_row = max(0, active_row_idx - (target_rows // 2))
+            max_start = max(0, len(block_lines) - target_rows)
+            start_row = min(start_row, max_start)
+            block_lines = block_lines[start_row : start_row + target_rows]
+        elif len(block_lines) < target_rows:
+            missing = target_rows - len(block_lines)
+            top_pad = missing // 2
+            bottom_pad = missing - top_pad
+            block_lines = ([(blank_row, False)] * top_pad) + block_lines + ([(blank_row, False)] * bottom_pad)
+
+        desc = "```ansi\n" + "\n".join(row for row, _ in block_lines) + "\n```"
+        embed = discord.Embed(title=heading, description=desc)
+        return embed
+
+    def _build_lyrics_embeds(
+        self,
+        *,
+        title: str,
+        artist: Optional[str],
+        lyrics: str,
+        source: str,
+        synced: bool = False,
+        source_url: Optional[str] = None,
+    ) -> list[discord.Embed]:
+        safe_title = discord.utils.escape_markdown(title or "Unknown Title", as_needed=True)
+        safe_artist = discord.utils.escape_markdown(artist or "Unknown Artist", as_needed=True)
+        heading = f"{safe_title} - {safe_artist}" if safe_artist else safe_title
+        pages = self._split_text_pages(lyrics, max_chars=3800)
+        embeds: list[discord.Embed] = []
+        total_pages = len(pages)
+
+        for idx, chunk in enumerate(pages, start=1):
+            title_text = heading if total_pages == 1 else f"{heading} ({idx}/{total_pages})"
+            embed = discord.Embed(title=title_text, description=chunk or "_(No lyrics text)_")
+            embeds.append(embed)
+
+        return embeds
+
+    async def _send_lyrics(
+        self,
+        interaction: discord.Interaction,
+        *,
+        query: Optional[str] = None,
+        ephemeral: bool = False,
+    ) -> None:
+        player: Optional[wavelink.Player] = None
+        title = ""
+        artist: Optional[str] = None
+        duration_ms: Optional[int] = None
+        album: Optional[str] = None
+        spotify_track_id: Optional[str] = None
+
+        if query and query.strip():
+            raw_query = " ".join(str(query).split()).strip()
+            spotify_track_id = self._extract_spotify_track_id(raw_query)
+            title, artist = self._split_lyrics_query(raw_query)
+        else:
+            if not interaction.guild:
+                await self._reply(interaction, "Provide a song query when used outside a server.", ephemeral=True)
+                return
+
+            player = cast(Optional[wavelink.Player], interaction.guild.voice_client)
+            current = getattr(player, "current", None) if player else None
+            if not current:
+                await self._reply(
+                    interaction,
+                    "No current track. Start playback first, then use the 🎤 Lyrics button in `/music`.",
+                    ephemeral=True,
+                )
+                return
+
+            title = str(getattr(current, "title", "") or "").strip()
+            artist = str(getattr(current, "author", "") or "").strip()
+            artist = re.sub(r"\s*-\s*topic\s*$", "", artist, flags=re.IGNORECASE).strip() or None
+            album = self._extract_track_album_name(current)
+            spotify_track_id = self._extract_track_spotify_id(current)
+            try:
+                duration_ms = int(getattr(current, "length", 0) or 0)
+            except (TypeError, ValueError):
+                duration_ms = None
+
+        if not title:
+            await self._reply(interaction, "Please provide a valid song title.", ephemeral=True)
+            return
+
+        if not await self._safe_defer(interaction, thinking=True, ephemeral=ephemeral):
+            return
+
+        if spotify_track_id and (not artist or self._is_url(title)):
+            try:
+                from utils.resolver import resolver as spotify_resolver
+
+                track_info = await spotify_resolver.get_single_track(f"https://open.spotify.com/track/{spotify_track_id}")
+            except Exception as exc:
+                logging.debug("Failed Spotify metadata pre-resolve for lyrics (%s): %s", spotify_track_id, exc)
+                track_info = None
+
+            if track_info:
+                title = str(getattr(track_info, "title", "") or "").strip() or title
+                artist = str(getattr(track_info, "artist", "") or "").strip() or artist
+                album = str(getattr(track_info, "album", "") or "").strip() or album
+                try:
+                    meta_duration = int(getattr(track_info, "duration_ms", 0) or 0)
+                    if meta_duration > 0:
+                        duration_ms = meta_duration
+                except (TypeError, ValueError):
+                    pass
+
+        from utils.lyrics import lyrics_resolver
+
+        result = await lyrics_resolver.get_lyrics(
+            title=title,
+            artist=artist,
+            duration_ms=duration_ms,
+            album=album,
+            spotify_track_id=spotify_track_id,
+        )
+        if not result:
+            hint = f" for **{title}**" + (f" by **{artist}**" if artist else "")
+            await interaction.followup.send(
+                f"Sorry, I couldn't find lyrics{hint} 😭",
+                ephemeral=ephemeral,
+            )
+            return
+
+        synced_lines = self._parse_synced_lyrics_lines(result.synced_lyrics or result.lyrics)
+        current_track = getattr(player, "current", None) if player else None
+        if player and current_track and synced_lines and len(synced_lines) > 1 and not query:
+            track_key = self._track_identity(current_track)
+            anchor_ms = int(getattr(player, "position", 0) or 0)
+            anchor_at = time.monotonic()
+            active_index = self._find_active_synced_index(synced_lines, anchor_ms)
+            live_embed = self._build_live_lyrics_embed(
+                title=result.title,
+                artist=result.artist,
+                lines=synced_lines,
+                active_index=active_index,
+            )
+            sent = await interaction.followup.send(embed=live_embed, ephemeral=ephemeral, wait=True)
+
+            task = asyncio.create_task(
+                self._run_live_lyrics_updates(
+                    message=sent,
+                    player=player,
+                    track_key=track_key,
+                    lines=synced_lines,
+                    title=result.title,
+                    artist=result.artist,
+                    anchor_ms=anchor_ms,
+                    anchor_at=anchor_at,
+                )
+            )
+            self._live_lyrics_tasks[id(sent)] = task
+            return
+
+        embeds = self._build_lyrics_embeds(
+            title=result.title,
+            artist=result.artist,
+            lyrics=result.lyrics,
+            source=result.source,
+            synced=result.synced,
+            source_url=result.source_url,
+        )
+
+        if len(embeds) == 1:
+            await interaction.followup.send(embed=embeds[0], ephemeral=ephemeral)
+            return
+
+        view = LyricsPaginatorView(embeds, owner_id=int(interaction.user.id))
+        sent = await interaction.followup.send(embed=embeds[0], view=view, ephemeral=ephemeral, wait=True)
+        view.message = sent
+
+    async def _send_current_lyrics(
+        self,
+        interaction: discord.Interaction,
+        *,
+        ephemeral: bool = True,
+    ) -> None:
+        await self._send_lyrics(interaction, query=None, ephemeral=ephemeral)
+
+    async def _run_live_lyrics_updates(
+        self,
+        *,
+        message: discord.Message,
+        player: wavelink.Player,
+        track_key: str,
+        lines: list[tuple[int, str]],
+        title: str,
+        artist: Optional[str],
+        anchor_ms: int,
+        anchor_at: float,
+    ) -> None:
+        last_idx = -2
+        poll_interval = 0.4
+        try:
+            while True:
+                current_track = getattr(player, "current", None)
+                if not current_track or self._track_identity(current_track) != track_key:
+                    break
+
+                base_pos = int(getattr(player, "position", 0) or 0)
+                if base_pos > anchor_ms:
+                    anchor_ms = base_pos
+                    anchor_at = time.monotonic()
+
+                position_ms = self._display_player_position_ms(
+                    player,
+                    anchor_ms=anchor_ms,
+                    anchor_at=anchor_at,
+                )
+                idx = self._find_active_synced_index(lines, position_ms)
+                if idx != last_idx:
+                    last_idx = idx
+                    embed = self._build_live_lyrics_embed(
+                        title=title,
+                        artist=artist,
+                        lines=lines,
+                        active_index=idx,
+                    )
+                    try:
+                        await message.edit(embed=embed)
+                    except discord.NotFound:
+                        break
+                    except discord.HTTPException:
+                        break
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._live_lyrics_tasks.pop(id(message), None)
+
+    @staticmethod
     def _build_query_variants(query: str, *, title: Optional[str] = None, artist: Optional[str] = None) -> list[str]:
         variants: list[str] = []
 
@@ -329,18 +1022,322 @@ class Music(commands.Cog):
         if title and artist:
             add(f"{title} {artist}")
             add(f"{title} - {artist}")
+            add(f"{artist} - {title}")
+            add(f"\"{title}\" \"{artist}\"")
 
             stripped_title = re.sub(r"\([^)]*\)|\[[^\]]*\]", "", title).strip()
             if stripped_title and stripped_title != title:
                 add(f"{stripped_title} {artist}")
+                add(f"\"{stripped_title}\" \"{artist}\"")
 
         base_snapshot = list(variants)
         for item in base_snapshot:
             add(item.replace("’", "'"))
             add(item.replace("'", ""))
             add(item.replace("&", "and"))
+            add(item.replace("-", " "))
 
-        return variants[:6]
+        return variants[:10]
+
+    @staticmethod
+    def _normalize_match_string(raw: Optional[str]) -> str:
+        text = str(raw or "").lower()
+        text = text.replace("’", "'")
+        text = re.sub(r"[\(\[].*?[\)\]]", " ", text)
+        text = re.sub(
+            r"\b(official|audio|video|lyrics?|lyric|remastered|remaster|hd|4k|hq|visualizer)\b",
+            " ",
+            text,
+        )
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        return " ".join(text.split())
+
+    @staticmethod
+    def _text_similarity(a: Optional[str], b: Optional[str]) -> float:
+        left = Music._normalize_match_string(a)
+        right = Music._normalize_match_string(b)
+        if not left or not right:
+            return 0.0
+        return difflib.SequenceMatcher(None, left, right).ratio()
+
+    @staticmethod
+    def _token_overlap(a: Optional[str], b: Optional[str]) -> float:
+        left_tokens = set(Music._normalize_match_string(a).split())
+        right_tokens = set(Music._normalize_match_string(b).split())
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens), 1)
+
+    @staticmethod
+    def _token_f1(a: Optional[str], b: Optional[str]) -> float:
+        left_tokens = set(Music._normalize_match_string(a).split())
+        right_tokens = set(Music._normalize_match_string(b).split())
+        if not left_tokens or not right_tokens:
+            return 0.0
+        overlap = len(left_tokens & right_tokens)
+        precision = overlap / len(right_tokens)
+        recall = overlap / len(left_tokens)
+        if precision + recall == 0:
+            return 0.0
+        return 2 * precision * recall / (precision + recall)
+
+    @staticmethod
+    def _char_ngram_cosine(a: Optional[str], b: Optional[str], n: int = 3) -> float:
+        left = Music._normalize_match_string(a).replace(" ", "")
+        right = Music._normalize_match_string(b).replace(" ", "")
+        if len(left) < n or len(right) < n:
+            return 0.0
+
+        left_counts: dict[str, int] = {}
+        right_counts: dict[str, int] = {}
+        for i in range(len(left) - n + 1):
+            gram = left[i : i + n]
+            left_counts[gram] = left_counts.get(gram, 0) + 1
+        for i in range(len(right) - n + 1):
+            gram = right[i : i + n]
+            right_counts[gram] = right_counts.get(gram, 0) + 1
+
+        overlap = set(left_counts) & set(right_counts)
+        if not overlap:
+            return 0.0
+
+        dot = sum(left_counts[g] * right_counts[g] for g in overlap)
+        left_norm = math.sqrt(sum(v * v for v in left_counts.values()))
+        right_norm = math.sqrt(sum(v * v for v in right_counts.values()))
+        if left_norm <= 0 or right_norm <= 0:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    @staticmethod
+    def _split_artist_tokens(raw: Optional[str]) -> set[str]:
+        text = Music._normalize_match_string(raw)
+        if not text:
+            return set()
+        parts = re.split(r"\b(?:feat|ft|featuring|with|and|x)\b|[,&/+]", text)
+        tokens = {p.strip() for p in parts if p and p.strip()}
+        return {token for token in tokens if len(token) > 1}
+
+    @staticmethod
+    def _artist_similarity(expected: Optional[str], actual: Optional[str]) -> float:
+        expected_tokens = Music._split_artist_tokens(expected)
+        actual_tokens = Music._split_artist_tokens(actual)
+        if not expected_tokens or not actual_tokens:
+            return 0.0
+        overlap = len(expected_tokens & actual_tokens)
+        return overlap / len(expected_tokens | actual_tokens)
+
+    @classmethod
+    def _extract_version_tags(cls, raw: Optional[str]) -> set[str]:
+        text = cls._normalize_match_string(raw)
+        if not text:
+            return set()
+        tags: set[str] = set()
+        for key, patterns in cls._TRACK_VERSION_PATTERNS.items():
+            if any(re.search(pattern, text) for pattern in patterns):
+                tags.add(key)
+        return tags
+
+    @staticmethod
+    def _source_rrf_weight(source: Optional[wavelink.TrackSource]) -> float:
+        if source == wavelink.TrackSource.YouTubeMusic:
+            return 1.0
+        if source == wavelink.TrackSource.YouTube:
+            return 0.9
+        if source == wavelink.TrackSource.SoundCloud:
+            return 0.8
+        return 0.72
+
+    @staticmethod
+    def _query_variant_weight(index: int) -> float:
+        if index <= 0:
+            return 1.0
+        return max(0.55, 1.0 - (0.07 * index))
+
+    @staticmethod
+    def _candidate_key(track: wavelink.Playable) -> str:
+        identifier = (
+            getattr(track, "identifier", None)
+            or getattr(track, "uri", None)
+            or f"{getattr(track, 'title', '')}|{getattr(track, 'author', '')}|{getattr(track, 'length', 0)}"
+        )
+        return str(identifier).strip().lower()
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        try:
+            return 1.0 / (1.0 + math.exp(-x))
+        except OverflowError:
+            return 0.0 if x < 0 else 1.0
+
+    async def _get_ml_reranker(self):
+        if not self._ml_reranker_enabled or self._ml_reranker_load_failed:
+            return None
+        if self._ml_reranker is not None:
+            return self._ml_reranker
+
+        async with self._ml_reranker_lock:
+            if self._ml_reranker is not None:
+                return self._ml_reranker
+            if self._ml_reranker_load_failed:
+                return None
+
+            try:
+                from sentence_transformers import CrossEncoder  # type: ignore
+            except Exception as exc:
+                self._ml_reranker_load_failed = True
+                logging.warning(
+                    "ML reranker enabled but `sentence-transformers` is unavailable: %s",
+                    exc,
+                )
+                return None
+
+            try:
+                self._ml_reranker = await asyncio.to_thread(CrossEncoder, self._ml_reranker_model_name)
+                logging.info("Loaded ML reranker model: %s", self._ml_reranker_model_name)
+            except Exception as exc:
+                self._ml_reranker_load_failed = True
+                logging.warning(
+                    "Failed to load ML reranker model `%s`: %s",
+                    self._ml_reranker_model_name,
+                    exc,
+                )
+                return None
+
+        return self._ml_reranker
+
+    async def _compute_ml_rerank_scores(
+        self,
+        *,
+        title: Optional[str],
+        artist: Optional[str],
+        candidates: list[wavelink.Playable],
+    ) -> dict[str, float]:
+        if not self._ml_reranker_enabled:
+            return {}
+        query = " ".join(part for part in [title, artist] if part and str(part).strip()).strip()
+        if not query or not candidates:
+            return {}
+
+        model = await self._get_ml_reranker()
+        if model is None:
+            return {}
+
+        shortlist = candidates[: self._ml_reranker_max_candidates]
+
+        def _predict() -> list[float]:
+            pairs = [
+                (
+                    query,
+                    " | ".join(
+                        p
+                        for p in [
+                            str(getattr(track, "title", "") or ""),
+                            str(getattr(track, "author", "") or ""),
+                            self._fmt_duration(track),
+                        ]
+                        if p
+                    ),
+                )
+                for track in shortlist
+            ]
+            raw = model.predict(pairs)
+            return [float(item) for item in list(raw)]
+
+        try:
+            raw_scores = await asyncio.to_thread(_predict)
+        except Exception as exc:
+            logging.warning("ML reranker prediction failed; falling back to heuristic scoring: %s", exc)
+            return {}
+
+        normalized: dict[str, float] = {}
+        for track, raw_score in zip(shortlist, raw_scores):
+            normalized[self._candidate_key(track)] = self._sigmoid(raw_score)
+        return normalized
+
+    def _score_candidate(
+        self,
+        track: wavelink.Playable,
+        *,
+        title: Optional[str] = None,
+        artist: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        isrc: Optional[str] = None,
+        retrieval_score: float = 0.0,
+        ml_score: float = 0.0,
+    ) -> float:
+        score = 0.0
+        candidate_title = str(getattr(track, "title", "") or "")
+        candidate_author = str(getattr(track, "author", "") or "")
+
+        if title:
+            score += self._text_similarity(title, candidate_title) * 42
+            score += self._token_overlap(title, candidate_title) * 22
+            score += self._token_f1(title, candidate_title) * 22
+            score += self._char_ngram_cosine(title, candidate_title) * 14
+
+        if artist:
+            score += self._text_similarity(artist, candidate_author) * 22
+            score += self._token_overlap(artist, candidate_author) * 15
+            score += self._artist_similarity(artist, candidate_author) * 28
+            norm_artist = self._normalize_match_string(artist)
+            norm_author = self._normalize_match_string(candidate_author)
+            if norm_artist and norm_author and (norm_artist in norm_author or norm_author in norm_artist):
+                score += 8
+            if self._artist_similarity(artist, candidate_author) <= 0 and self._token_overlap(artist, candidate_author) < 0.15:
+                score -= 16
+
+        expected_isrc = str(isrc or "").strip().upper()
+        candidate_isrc = str(getattr(track, "isrc", "") or "").strip().upper()
+        if expected_isrc:
+            if candidate_isrc and candidate_isrc == expected_isrc:
+                score += 140
+            elif candidate_isrc and candidate_isrc != expected_isrc:
+                score -= 48
+
+        try:
+            expected_duration = int(duration_ms) if duration_ms is not None else 0
+        except (TypeError, ValueError):
+            expected_duration = 0
+        candidate_duration = int(getattr(track, "length", 0) or 0)
+        if expected_duration > 0 and candidate_duration > 0:
+            delta = abs(candidate_duration - expected_duration)
+            if delta <= 2000:
+                score += 22
+            elif delta <= 5000:
+                score += 16
+            elif delta <= 10000:
+                score += 10
+            elif delta <= 20000:
+                score += 3
+            elif delta >= 60000:
+                score -= 25
+            elif delta >= 45000:
+                score -= 14
+        elif candidate_duration <= 0:
+            score -= 3
+
+        # Source/quality hints.
+        candidate_author_lower = candidate_author.lower()
+        if " - topic" in candidate_author_lower:
+            score += 6
+        if "vevo" in candidate_author_lower:
+            score += 4
+
+        requested_tags = self._extract_version_tags(title)
+        candidate_tags = self._extract_version_tags(candidate_title)
+        if requested_tags:
+            score += 9 * len(requested_tags & candidate_tags)
+            score -= 7 * len(requested_tags - candidate_tags)
+            score -= 10 * len(candidate_tags - requested_tags)
+        else:
+            score -= 11 * len(candidate_tags)
+
+        if retrieval_score > 0:
+            score += retrieval_score * self._resolver_rrf_scale
+        if ml_score > 0:
+            score += ml_score * self._ml_reranker_weight
+
+        return score
 
     @staticmethod
     def _extract_candidates(search_result) -> list[wavelink.Playable]:
@@ -358,9 +1355,17 @@ class Music(commands.Cog):
         query: str,
         title: Optional[str] = None,
         artist: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        isrc: Optional[str] = None,
         matcher=None,
     ) -> Optional[wavelink.Playable]:
-        cache_keys = self._build_resolved_link_keys(query=query, title=title, artist=artist)
+        cache_keys = self._build_resolved_link_keys(
+            query=query,
+            title=title,
+            artist=artist,
+            duration_ms=duration_ms,
+            isrc=isrc,
+        )
         cached_uri = self._get_cached_resolved_link(cache_keys)
         if cached_uri:
             cached_result = await self._safe_wavelink_search(cached_uri, suppress_errors=True)
@@ -370,6 +1375,8 @@ class Music(commands.Cog):
                     cached_candidates,
                     title=title,
                     artist=artist,
+                    duration_ms=duration_ms,
+                    isrc=isrc,
                     matcher=matcher,
                 ) or cached_candidates[0]
             self._remove_cached_resolved_link(cache_keys)
@@ -378,32 +1385,90 @@ class Music(commands.Cog):
         if not variants:
             return None
 
-        search_plan: list[tuple[Optional[wavelink.TrackSource], str]] = []
-        primary = variants[0]
-        search_plan.append((wavelink.TrackSource.YouTubeMusic, primary))
+        sources = (
+            wavelink.TrackSource.YouTubeMusic,
+            wavelink.TrackSource.YouTube,
+            wavelink.TrackSource.SoundCloud,
+        )
+        search_plan: list[tuple[Optional[wavelink.TrackSource], str, int]] = []
+        seen_plan: set[tuple[Optional[wavelink.TrackSource], str]] = set()
 
-        for source in (wavelink.TrackSource.YouTubeMusic, wavelink.TrackSource.YouTube):
-            for candidate_query in variants:
-                if source == wavelink.TrackSource.YouTubeMusic and candidate_query == primary:
+        for source in sources:
+            for variant_idx, candidate_query in enumerate(variants):
+                plan_key = (source, candidate_query)
+                if plan_key in seen_plan:
                     continue
-                search_plan.append((source, candidate_query))
+                seen_plan.add(plan_key)
+                search_plan.append((source, candidate_query, variant_idx))
 
-        for source, candidate_query in search_plan:
+        # Final generic pass lets Lavalink choose any enabled source manager.
+        for variant_idx, candidate_query in enumerate(variants):
+            plan_key = (None, candidate_query)
+            if plan_key in seen_plan:
+                continue
+            seen_plan.add(plan_key)
+            search_plan.append((None, candidate_query, variant_idx))
+
+        merged_candidates: dict[str, wavelink.Playable] = {}
+        retrieval_scores: dict[str, float] = {}
+        for source, candidate_query, variant_idx in search_plan:
             kwargs = {"source": source} if source else {}
             result = await self._safe_wavelink_search(candidate_query, suppress_errors=True, **kwargs)
             candidates = self._extract_candidates(result)
             if not candidates:
                 continue
 
-            playable = self._pick_playable_candidate(
-                candidates,
+            source_weight = self._source_rrf_weight(source)
+            query_weight = self._query_variant_weight(variant_idx)
+            for rank, candidate in enumerate(candidates[: self._resolver_per_query_limit], start=1):
+                key = self._candidate_key(candidate)
+                if key not in merged_candidates:
+                    merged_candidates[key] = candidate
+                retrieval_scores[key] = retrieval_scores.get(key, 0.0) + (
+                    (source_weight * query_weight) / (self._resolver_rrf_k + rank)
+                )
+
+            # Don't over-query once we already have a broad candidate set.
+            if len(merged_candidates) >= self._resolver_max_merged_candidates:
+                break
+
+        if merged_candidates:
+            merged = list(merged_candidates.values())
+            ml_scores = await self._compute_ml_rerank_scores(
                 title=title,
                 artist=artist,
+                candidates=merged,
+            )
+            playable, top_score, second_score = self._pick_playable_candidate(
+                merged,
+                title=title,
+                artist=artist,
+                duration_ms=duration_ms,
+                isrc=isrc,
                 matcher=matcher,
-            ) or candidates[0]
+                retrieval_scores=retrieval_scores,
+                ml_scores=ml_scores,
+                return_scores=True,
+            )
+            if playable is None:
+                playable = next(iter(merged_candidates.values()))
+                top_score = float("-inf")
+                second_score = float("-inf")
             playable_uri = str(getattr(playable, "uri", "")).strip()
-            if playable_uri:
+            margin = top_score - second_score if second_score != float("-inf") else top_score
+            if (
+                playable_uri
+                and top_score >= self._resolver_min_cache_score
+                and margin >= self._resolver_min_cache_margin
+            ):
                 self._set_cached_resolved_link(cache_keys, playable_uri)
+            elif playable_uri:
+                logging.debug(
+                    "Skipping resolver cache write due to low confidence: score=%.2f margin=%.2f query=%r",
+                    top_score,
+                    margin,
+                    query,
+                )
             return playable
 
         logging.warning(
@@ -420,62 +1485,49 @@ class Music(commands.Cog):
         *,
         title: Optional[str] = None,
         artist: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        isrc: Optional[str] = None,
         matcher=None,
-    ) -> Optional[wavelink.Playable]:
+        retrieval_scores: Optional[dict[str, float]] = None,
+        ml_scores: Optional[dict[str, float]] = None,
+        return_scores: bool = False,
+    ):
         if not candidates:
+            if return_scores:
+                return None, float("-inf"), float("-inf")
             return None
 
-        shortlist = list(candidates[:12])
+        shortlist = list(candidates[:25])
 
+        matcher_boost_id = ""
         if matcher and title and artist:
             matched = matcher.get_best_match(title, artist, shortlist)
             if matched:
-                return matched
+                matcher_boost_id = self._track_identity(matched)
 
-        def quality_score(track: wavelink.Playable) -> int:
-            score = 0
-            t = str(getattr(track, "title", "")).lower()
-            a = str(getattr(track, "author", "")).lower()
-            length = int(getattr(track, "length", 0) or 0)
+        scored: list[tuple[float, wavelink.Playable]] = []
+        for track in shortlist:
+            candidate_key = self._candidate_key(track)
+            score = self._score_candidate(
+                track,
+                title=title,
+                artist=artist,
+                duration_ms=duration_ms,
+                isrc=isrc,
+                retrieval_score=(retrieval_scores or {}).get(candidate_key, 0.0),
+                ml_score=(ml_scores or {}).get(candidate_key, 0.0),
+            )
+            if matcher_boost_id and self._track_identity(track) == matcher_boost_id:
+                score += 7.5
+            scored.append((score, track))
 
-            # Prefer official/Topic sources for cleaner uploads.
-            if " - topic" in a:
-                score += 8
-            if "vevo" in a:
-                score += 4
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_track = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else float("-inf")
 
-            # Prefer pure audio uploads and penalize edited variants.
-            if "official audio" in t or " audio" in t:
-                score += 3
-            if "official video" in t or "music video" in t:
-                score -= 2
-
-            for noisy in (
-                "live",
-                "cover",
-                "karaoke",
-                "instrumental",
-                "acoustic",
-                "remix",
-                "8d",
-                "slowed",
-                "reverb",
-                "sped up",
-                "nightcore",
-                "tiktok",
-            ):
-                if noisy in t:
-                    score -= 8
-
-            # Prefer normal song durations.
-            if 120_000 <= length <= 480_000:
-                score += 2
-            elif length == 0:
-                score -= 1
-
-            return score
-
-        return max(shortlist, key=quality_score)
+        if return_scores:
+            return best_track, best_score, second_score
+        return best_track
 
     async def _resolve_spotify_tracks_parallel(self, tracks, *, matcher, concurrency: int = 4, progress_callback=None):
         concurrency = max(1, min(concurrency, 30))
@@ -491,8 +1543,15 @@ class Music(commands.Cog):
                         query=track_obj.query,
                         title=track_obj.title,
                         artist=track_obj.artist,
+                        duration_ms=getattr(track_obj, "duration_ms", None),
+                        isrc=getattr(track_obj, "isrc", None),
                         matcher=matcher,
                     )
+                self._annotate_playable_metadata(
+                    playable,
+                    album=getattr(track_obj, "album", None),
+                    spotify_track_id=getattr(track_obj, "spotify_track_id", None),
+                )
                 return idx, playable
             except asyncio.CancelledError:
                 raise
@@ -1083,8 +2142,9 @@ class Music(commands.Cog):
             name="Dashboard",
             value=(
                 "Playback: Restart, Pause, Skip, Shuffle, Loop\n"
-                "Queue: Add, Queue (with Clear Queue), Lists\n"
-                "Audio: Set Volume + Filter popup"
+                "Queue: Add, Queue (with Clear Queue), Lists, Lyrics\n"
+                "Audio: Set Volume + Filter popup\n"
+                "Lyrics: 🎤 button opens live-synced lyrics for current track (when timestamps exist)"
             ),
             inline=False,
         )
@@ -1336,11 +2396,18 @@ class Music(commands.Cog):
                     query=first_track.query,
                     title=first_track.title,
                     artist=first_track.artist,
+                    duration_ms=getattr(first_track, "duration_ms", None),
+                    isrc=getattr(first_track, "isrc", None),
                     matcher=matcher,
                 )
                 if not first_playable:
                     self._clear_queue_busy(player)
                     return await interaction.followup.send("❌ Could not find the first track's audio.")
+                self._annotate_playable_metadata(
+                    first_playable,
+                    album=getattr(first_track, "album", None),
+                    spotify_track_id=getattr(first_track, "spotify_track_id", None),
+                )
                 
                 if index is not None:
                     safe_idx = max(0, min(index, player.queue.count))
@@ -1460,10 +2527,17 @@ class Music(commands.Cog):
                     query=track_info.query,
                     title=track_info.title,
                     artist=track_info.artist,
+                    duration_ms=getattr(track_info, "duration_ms", None),
+                    isrc=getattr(track_info, "isrc", None),
                     matcher=matcher,
                 )
                 if not playable:
                     return await interaction.followup.send("❌ Could not find audio for this Spotify track.")
+                self._annotate_playable_metadata(
+                    playable,
+                    album=getattr(track_info, "album", None),
+                    spotify_track_id=getattr(track_info, "spotify_track_id", None),
+                )
                 
                 if index is not None:
                     # Clamp index to avoid OOB crashes
@@ -1497,37 +2571,62 @@ class Music(commands.Cog):
             # Normal Search
             if self._is_url(query):
                 tracks: wavelink.Search = await self._safe_wavelink_search(query)
-            else:
-                # Prefer YouTube Music search for cleaner audio sources by default.
-                tracks: wavelink.Search = await self._safe_wavelink_search(
-                    query,
-                    source=wavelink.TrackSource.YouTubeMusic,
-                )
-            if not tracks:
-                await interaction.followup.send(f"Could not find any songs for `{query}`.")
-                return
+                if not tracks:
+                    await interaction.followup.send(f"Could not find any songs for `{query}`.")
+                    return
 
-            if isinstance(tracks, wavelink.Playlist):
-                reversed_tracks = list(reversed(tracks.tracks))
-                if index is not None:
-                    added = 0
-                    for track in reversed_tracks:
-                        safe_idx = max(0, min(index + added, player.queue.count))
-                        player.queue.put_at(safe_idx, track)
-                        added += 1
+                if isinstance(tracks, wavelink.Playlist):
+                    reversed_tracks = list(reversed(tracks.tracks))
+                    if index is not None:
+                        added = 0
+                        for track in reversed_tracks:
+                            safe_idx = max(0, min(index + added, player.queue.count))
+                            player.queue.put_at(safe_idx, track)
+                            added += 1
+                    else:
+                        for track in reversed_tracks:
+                            await player.queue.put_wait(track)
+                        added = len(reversed_tracks)
+                    await interaction.followup.send(f"Added the playlist **{tracks.name}** ({added} songs, Newest First) to the queue.")
                 else:
-                    for track in reversed_tracks:
+                    track: wavelink.Playable = self._pick_playable_candidate(
+                        list(tracks),
+                        title=query,
+                        artist=None,
+                    ) or tracks[0]
+                    if index is not None:
+                        safe_idx = max(0, min(index, player.queue.count))
+                        player.queue.put_at(safe_idx, track)
+                    else:
                         await player.queue.put_wait(track)
-                    added = len(reversed_tracks)
-                await interaction.followup.send(f"Added the playlist **{tracks.name}** ({added} songs, Newest First) to the queue.")
+
+                    dur = self._fmt_duration(track)
+                    msg = f"Added **{track.title}** `({dur})`"
+                    if index is not None:
+                        actual = safe_idx
+                        msg += f" — playing next" if actual == 0 else f" at position **{actual}** in queue"
+                        if actual != index:
+                            msg += f" *(requested {index}, clamped to {actual})*"
+                    else:
+                        msg += " to the queue"
+                    await interaction.followup.send(msg)
             else:
-                track: wavelink.Playable = self._pick_playable_candidate(list(tracks)) or tracks[0]
+                # Multi-source smart resolver for plain-text queries.
+                track = await self._resolve_playable_with_fallbacks(
+                    query=query,
+                    title=query,
+                    artist=None,
+                )
+                if not track:
+                    await interaction.followup.send(f"Could not find any songs for `{query}`.")
+                    return
+
                 if index is not None:
                     safe_idx = max(0, min(index, player.queue.count))
                     player.queue.put_at(safe_idx, track)
                 else:
                     await player.queue.put_wait(track)
-                
+
                 dur = self._fmt_duration(track)
                 msg = f"Added **{track.title}** `({dur})`"
                 if index is not None:
