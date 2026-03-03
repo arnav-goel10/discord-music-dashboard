@@ -85,6 +85,11 @@ class MusicBot(_BotBase):
             await resolver.close()
         except Exception as e:
             logging.warning(f"Resolver cleanup failed: {e}")
+        try:
+            from utils.lyrics import lyrics_resolver
+            await lyrics_resolver.close()
+        except Exception as e:
+            logging.warning(f"Lyrics resolver cleanup failed: {e}")
         await super().close()
 
 async def main():

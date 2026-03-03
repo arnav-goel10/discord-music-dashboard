@@ -1149,11 +1149,14 @@ class SpotifyUI(_DashboardBaseView):
         self.add_track = discord.ui.Button(
             style=discord.ButtonStyle.success, emoji="➕", label="", row=1
         )
+        self.open_lyrics = discord.ui.Button(
+            style=discord.ButtonStyle.secondary, emoji="🎤", label="", row=1
+        )
         self.show_queue = discord.ui.Button(
             style=discord.ButtonStyle.secondary, emoji=None, label="Q", row=1
         )
         self.manage_lists = discord.ui.Button(
-            style=discord.ButtonStyle.primary, emoji="💾", label="", row=1
+            style=discord.ButtonStyle.primary, emoji="💾", label="", row=2
         )
         self.volume_set = discord.ui.Button(
             style=discord.ButtonStyle.secondary, emoji="🔊", label="", row=0
@@ -1168,6 +1171,7 @@ class SpotifyUI(_DashboardBaseView):
         self.shuffle_queue.callback = self._manual_shuffle_queue
         self.toggle_loop.callback = self._manual_toggle_loop
         self.add_track.callback = self._manual_add_track
+        self.open_lyrics.callback = self._manual_open_lyrics
         self.show_queue.callback = self._manual_show_queue
         self.manage_lists.callback = self._manual_manage_lists
         self.volume_set.callback = self._manual_volume_set
@@ -1188,13 +1192,17 @@ class SpotifyUI(_DashboardBaseView):
         self._v2_controls_row_queue = action_row_cls(
             self.shuffle_queue,
             self.filter_popup,
+            self.open_lyrics,
             self.show_queue,
-            self.manage_lists,
             self.add_track,
+        )
+        self._v2_controls_row_library = action_row_cls(
+            self.manage_lists,
         )
 
         self.add_item(self._v2_controls_row_primary)
         self.add_item(self._v2_controls_row_queue)
+        self.add_item(self._v2_controls_row_library)
 
     def _reorder_fallback_controls_if_needed(self) -> None:
         if self._use_v2_layout:
@@ -1209,9 +1217,10 @@ class SpotifyUI(_DashboardBaseView):
             self.toggle_loop,
             self.shuffle_queue,
             self.filter_popup,
+            self.open_lyrics,
             self.show_queue,
-            self.manage_lists,
             self.add_track,
+            self.manage_lists,
         ]
 
         self.clear_items()
@@ -1235,6 +1244,9 @@ class SpotifyUI(_DashboardBaseView):
 
     async def _manual_add_track(self, interaction: discord.Interaction) -> None:
         await SpotifyUI.add_track(self, interaction, self.add_track)
+
+    async def _manual_open_lyrics(self, interaction: discord.Interaction) -> None:
+        await SpotifyUI.open_lyrics(self, interaction, self.open_lyrics)
 
     async def _manual_show_queue(self, interaction: discord.Interaction) -> None:
         await SpotifyUI.show_queue(self, interaction, self.show_queue)
@@ -1336,6 +1348,7 @@ class SpotifyUI(_DashboardBaseView):
         self.previous_track.disabled = not has_current
         self.skip_track.disabled = not has_current and queue_count == 0
         self.shuffle_queue.disabled = queue_count < 2
+        self.open_lyrics.disabled = not has_current
 
         self._sync_v2_dashboard_card()
 
@@ -1379,10 +1392,6 @@ class SpotifyUI(_DashboardBaseView):
         estimated = self._position_anchor_ms + int((now - self._position_anchor_at) * 1000)
         if estimated < base:
             estimated = base
-
-        # Prevent runaway local drift if websocket updates lag.
-        if estimated - base > 1800:
-            estimated = base + 1800
 
         length = int(getattr(track, "length", 0) or 0)
         if length > 0:
@@ -1679,6 +1688,14 @@ class SpotifyUI(_DashboardBaseView):
     async def add_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(AddTrackModal())
 
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🎤", label="", row=1)
+    async def open_lyrics(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        music_cog = _get_music_cog(interaction)
+        if not music_cog or not hasattr(music_cog, "_send_current_lyrics"):
+            await interaction.response.send_message("Lyrics are temporarily unavailable.", ephemeral=True)
+            return
+        await music_cog._send_current_lyrics(interaction, ephemeral=True)
+
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="Q", row=1)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self._live_player(interaction)
@@ -1690,7 +1707,7 @@ class SpotifyUI(_DashboardBaseView):
         except discord.NotFound:
             pass
 
-    @discord.ui.button(style=discord.ButtonStyle.primary, emoji="💾", label="", row=1)
+    @discord.ui.button(style=discord.ButtonStyle.primary, emoji="💾", label="", row=2)
     async def manage_lists(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         view = SavedPlaylistManagerView(
             self,
