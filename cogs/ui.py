@@ -1363,6 +1363,14 @@ class SpotifyUI(_DashboardBaseView):
             or "none"
         )
 
+    def _reset_position_anchor(self, position_ms: Optional[int] = None) -> None:
+        now = time.monotonic()
+        self._position_anchor_track_key = self._track_key(self.player.current)
+        if position_ms is None:
+            position_ms = int(getattr(self.player, "position", 0) or 0)
+        self._position_anchor_ms = max(0, int(position_ms))
+        self._position_anchor_at = now
+
     def _display_position_ms(self) -> int:
         track = self.player.current
         if not track:
@@ -1383,6 +1391,10 @@ class SpotifyUI(_DashboardBaseView):
 
         # Keep anchor in sync whenever Lavalink gives a newer authoritative position.
         if base > self._position_anchor_ms:
+            self._position_anchor_ms = base
+            self._position_anchor_at = now
+        # Also trust explicit backward seeks/restarts from Lavalink.
+        elif base + 800 < self._position_anchor_ms:
             self._position_anchor_ms = base
             self._position_anchor_at = now
 
@@ -1591,7 +1603,8 @@ class SpotifyUI(_DashboardBaseView):
         await interaction.response.defer()
         if player.current:
             await player.seek(0)
-        await self.update_player_message()
+            self._reset_position_anchor(0)
+        await self.update_player_message(force=True)
 
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="||", row=0)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
