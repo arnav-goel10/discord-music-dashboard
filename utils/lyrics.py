@@ -34,7 +34,7 @@ class LyricsResolver:
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
         self._cache_enabled = self._env_bool("LYRICS_CACHE_ENABLED", True)
-        self._cache_ttl_seconds = self._env_int("LYRICS_CACHE_TTL_SECONDS", 1_209_600, minimum=0)
+        self._cache_ttl_seconds = self._env_int("LYRICS_CACHE_TTL_SECONDS", 604_800, minimum=0)
         self._prefer_synced = self._env_bool("LYRICS_PREFER_SYNCED", False)
 
         self._lrclib_exact_min_score = self._env_float("LYRICS_LRCLIB_EXACT_MIN_SCORE", 118.0)
@@ -103,8 +103,10 @@ class LyricsResolver:
 
     def _db_connect(self) -> sqlite3.Connection:
         os.makedirs(os.path.dirname(self._cache_db_path), exist_ok=True)
-        conn = sqlite3.connect(self._cache_db_path)
+        conn = sqlite3.connect(self._cache_db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _ensure_cache_table(self) -> None:
@@ -375,6 +377,13 @@ class LyricsResolver:
             return compact
         return None
 
+    @staticmethod
+    def _normalize_stream_cache_key(raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        compact = " ".join(str(raw).split()).strip().lower()
+        return compact or None
+
     @classmethod
     def _title_variants(cls, title: str) -> list[str]:
         variants: list[str] = []
@@ -465,6 +474,7 @@ class LyricsResolver:
         album: Optional[str] = None,
         duration_ms: Optional[int] = None,
         spotify_track_id: Optional[str] = None,
+        stream_cache_key: Optional[str] = None,
     ) -> list[str]:
         keys: list[str] = []
 
@@ -493,6 +503,9 @@ class LyricsResolver:
         parsed_spotify_id = self._parse_spotify_track_id(spotify_track_id)
         if parsed_spotify_id:
             keys.insert(0, f"spotify::{parsed_spotify_id}")
+        normalized_stream_key = self._normalize_stream_cache_key(stream_cache_key)
+        if normalized_stream_key:
+            keys.insert(0, f"stream::{normalized_stream_key}")
 
         return keys[:24]
 
@@ -1303,6 +1316,7 @@ class LyricsResolver:
         duration_ms: Optional[int] = None,
         album: Optional[str] = None,
         spotify_track_id: Optional[str] = None,
+        stream_cache_key: Optional[str] = None,
     ) -> Optional[LyricsResult]:
         title = " ".join(str(title or "").split()).strip()
         artist = " ".join(str(artist or "").split()).strip() or None
@@ -1318,6 +1332,7 @@ class LyricsResolver:
             album=album,
             duration_ms=duration_ms,
             spotify_track_id=spotify_track_id,
+            stream_cache_key=stream_cache_key,
         )
         cached = self._get_cached(cache_keys)
         if cached and ("genius" not in cached.source.lower() or not self._looks_like_noisy_genius_lyrics(cached.lyrics)):
