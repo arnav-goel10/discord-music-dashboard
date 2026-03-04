@@ -5,12 +5,7 @@ from typing import Optional
 
 class TrackMatcher:
     def __init__(self):
-        # Keywords that drastically change the version of a song.
-        # Must stay in sync with the `noisy` tuple in Music._pick_playable_candidate.
-        self.penalty_keywords = [
-            "live", "cover", "karaoke", "instrumental", "acoustic",
-            "remix", "8d", "slowed", "reverb", "sped up", "nightcore", "tiktok",
-        ]
+        pass
 
     def sanitize_string(self, text: str) -> str:
         """Removes special characters and lowers case for better comparison."""
@@ -41,13 +36,6 @@ class TrackMatcher:
         target_title_clean = self.sanitize_string(original_title)
         target_artist_clean = self.sanitize_string(original_artist)
 
-        # Check if the original track is a special version (so we don't penalize it)
-        original_lower = original_title.lower()
-        target_is_live = "live" in original_lower
-        target_is_remix = "remix" in original_lower
-        target_is_acoustic = "acoustic" in original_lower
-        target_is_nightcore = "nightcore" in original_lower
-
         for track in candidates:
             score = 0.0
             
@@ -71,17 +59,6 @@ class TrackMatcher:
             if target_title_clean == candidate_title_clean:
                 score += 15
 
-            # 4. Keyword Penalties
-            for kw in self.penalty_keywords:
-                if kw in candidate_title:
-                    # Only penalize if the original didn't explicitly ask for it
-                    if kw == "live" and target_is_live: continue
-                    if kw == "remix" and target_is_remix: continue
-                    if kw == "acoustic" and target_is_acoustic: continue
-                    if kw == "nightcore" and target_is_nightcore: continue
-                    
-                    score -= 40 # Heavy penalty for playing a cover/karaoke when not requested
-                    
             # Update best match
             if score > highest_score:
                 highest_score = score

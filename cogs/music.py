@@ -598,11 +598,74 @@ class Music(commands.Cog):
         )
 
     @staticmethod
+    def _extract_track_source_title(track: Any) -> Optional[str]:
+        value = getattr(track, "_source_title", None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    @staticmethod
+    def _extract_track_source_artist(track: Any) -> Optional[str]:
+        value = getattr(track, "_source_artist", None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    @classmethod
+    def _lyrics_metadata_match(
+        cls,
+        *,
+        expected_title: Optional[str],
+        expected_artist: Optional[str],
+        actual_title: Optional[str],
+        actual_artist: Optional[str],
+    ) -> bool:
+        if not expected_title or not actual_title:
+            return False
+
+        title_sim = cls._text_similarity(expected_title, actual_title)
+        title_overlap = cls._token_overlap(expected_title, actual_title)
+        title_f1 = cls._token_f1(expected_title, actual_title)
+        title_ok = (
+            title_sim >= 0.72
+            or title_overlap >= 0.80
+            or title_f1 >= 0.80
+            or (title_sim >= 0.62 and (title_overlap >= 0.62 or title_f1 >= 0.62))
+        )
+        if not title_ok:
+            return False
+
+        if not expected_artist:
+            return True
+
+        artist_sim = cls._text_similarity(expected_artist, actual_artist)
+        artist_overlap = cls._token_overlap(expected_artist, actual_artist)
+        artist_set = cls._artist_similarity(expected_artist, actual_artist)
+        norm_expected_artist = cls._normalize_match_string(expected_artist)
+        norm_actual_artist = cls._normalize_match_string(actual_artist)
+        artist_ok = (
+            artist_sim >= 0.62
+            or artist_overlap >= 0.65
+            or artist_set >= 0.45
+            or (
+                norm_expected_artist
+                and norm_actual_artist
+                and (
+                    norm_expected_artist in norm_actual_artist
+                    or norm_actual_artist in norm_expected_artist
+                )
+            )
+        )
+        return artist_ok
+
+    @staticmethod
     def _annotate_playable_metadata(
         playable: Optional[wavelink.Playable],
         *,
         album: Optional[str] = None,
         spotify_track_id: Optional[str] = None,
+        source_title: Optional[str] = None,
+        source_artist: Optional[str] = None,
     ) -> None:
         if not playable:
             return
@@ -614,6 +677,16 @@ class Music(commands.Cog):
         if isinstance(spotify_track_id, str) and spotify_track_id.strip():
             try:
                 setattr(playable, "_spotify_track_id", spotify_track_id.strip())
+            except Exception:
+                pass
+        if isinstance(source_title, str) and source_title.strip():
+            try:
+                setattr(playable, "_source_title", source_title.strip())
+            except Exception:
+                pass
+        if isinstance(source_artist, str) and source_artist.strip():
+            try:
+                setattr(playable, "_source_artist", source_artist.strip())
             except Exception:
                 pass
 
@@ -716,33 +789,13 @@ class Music(commands.Cog):
         safe_artist = discord.utils.escape_markdown(artist or "Unknown Artist", as_needed=True)
         heading = f"{safe_title} - {safe_artist}" if safe_artist else safe_title
 
-        context_radius = 5
         window_size = 15
-        start = max(0, active_index - context_radius)
-        end = min(len(lines), active_index + context_radius + 1) if active_index >= 0 else min(len(lines), window_size)
-
-        rendered: list[tuple[bool, str]] = []
-        for idx in range(start, end):
-            _, line = lines[idx]
-            text = discord.utils.escape_markdown(line, as_needed=True)
-            text = " ".join(text.split())
-            if idx == active_index:
-                rendered.append((True, f"▶ {text} ◀"))
-            else:
-                rendered.append((False, text))
-
-        if not rendered:
-            rendered = [(False, "No synced line available yet")]
-
-        # Embed markdown does not support real alignment/font-size controls.
-        # Use a fixed-width ANSI block so layout stays stable and only the active line is colored.
-        # Keep fixed width below Discord client wrap threshold to prevent
-        # visual reflow/splitting of arrows and centered rows.
+        # Keep a strict fixed-size viewport to avoid frame-to-frame jitter.
+        # Long lyric lines can wrap, but the rendered viewport remains fixed.
         width = 57
         content_width = width - 2
         reset = "\u001b[0m"
         active_color = "\u001b[1;36m"
-        pad_char = "\u2007"  # Figure space: visually stable in Discord code blocks.
 
         def _clip_ellipsis(text: str, limit: int) -> str:
             if len(text) <= limit:
@@ -750,6 +803,14 @@ class Music(commands.Cog):
             if limit <= 1:
                 return text[:limit]
             return text[: limit - 1].rstrip() + "…"
+
+        def _center_visible(text: str, target: int) -> str:
+            if len(text) >= target:
+                return text
+            total_pad = target - len(text)
+            left = total_pad // 2
+            right = total_pad - left
+            return f"{' ' * left}{text}{' ' * right}"
 
         def _wrap_clean(text: str, limit: int) -> list[str]:
             if limit <= 1:
@@ -762,74 +823,55 @@ class Music(commands.Cog):
             )
             return wrapped or [""]
 
-        def _center_visible(text: str, target: int) -> str:
-            if len(text) >= target:
-                return text
-            total_pad = target - len(text)
-            left = total_pad // 2
-            right = total_pad - left
-            return f"{pad_char * left}{text}{pad_char * right}"
-
-        block_lines: list[tuple[str, bool]] = []
-        for is_active, line_text in rendered:
+        def _format_row(text: str, *, is_active: bool) -> str:
+            clean = " ".join(text.split())
             if is_active:
-                # Keep arrows fixed in left/right columns for visual stability.
-                # Wrap long active lines cleanly instead of overflowing.
                 inner = content_width - 4  # "▶ " + text + " ◀"
-                base = line_text.replace("▶ ", "", 1)
-                if base.endswith(" ◀"):
-                    base = base[:-2]
-                chunks = _wrap_clean(base.strip(), inner)
-                for chunk_idx, chunk in enumerate(chunks):
-                    centered_inner = _center_visible(chunk, inner)
+                clipped = _clip_ellipsis(clean, inner)
+                centered = _center_visible(clipped, inner)
+                return f"{active_color} ▶ {centered} ◀ {reset}"
+            clipped = _clip_ellipsis(clean, content_width)
+            centered = _center_visible(clipped, content_width)
+            return f" {centered} "
+
+        wrapped_rows: list[tuple[str, bool]] = []
+        for idx, (_, line) in enumerate(lines):
+            text = discord.utils.escape_markdown(line, as_needed=True)
+            clean = " ".join(text.split())
+            if idx == active_index:
+                inner = content_width - 4
+                for chunk_idx, chunk in enumerate(_wrap_clean(clean, inner)):
+                    centered = _center_visible(_clip_ellipsis(chunk, inner), inner)
                     if chunk_idx == 0:
-                        fixed = f"▶ {centered_inner} ◀"
+                        row = f"{active_color} ▶ {centered} ◀ {reset}"
                     else:
-                        fixed = f"  {centered_inner}  "
-                    block_lines.append((f"{active_color} {fixed} {reset}", True))
+                        row = f"{active_color}   {centered}   {reset}"
+                    wrapped_rows.append((row, True))
             else:
-                # Wrap long context lines cleanly and center each wrapped row.
-                chunks = _wrap_clean(line_text, content_width)
-                for chunk in chunks:
-                    centered = _center_visible(chunk, content_width)
-                    block_lines.append((f" {centered} ", False))
+                for chunk in _wrap_clean(clean, content_width):
+                    wrapped_rows.append((_format_row(chunk, is_active=False), False))
 
-        # Keep a fixed-height viewport so embed size does not jump.
-        target_rows = window_size
-        blank_row = f" {_center_visible('', content_width)} "
-        active_spacer_row = f" {_center_visible(' ', content_width)} "
+        if not wrapped_rows:
+            wrapped_rows.append((_format_row("No synced line available yet", is_active=False), False))
 
-        # Add breathing room around the full active lyric block without splitting
-        # wrapped highlighted rows.  Always insert spacers (even when no line is
-        # active) so the layout stays stable across index transitions.
-        active_indices = [i for i, (_, is_active_row) in enumerate(block_lines) if is_active_row]
-        if active_indices:
-            first_active = active_indices[0]
-            last_active = active_indices[-1]
-            block_lines.insert(first_active, (active_spacer_row, False))
-            block_lines.insert(last_active + 2, (active_spacer_row, False))
-        elif block_lines:
-            # No active line (before first lyric); insert spacers around the
-            # first row so the viewport geometry matches the highlighted state.
-            block_lines.insert(0, (active_spacer_row, False))
-            block_lines.insert(2, (active_spacer_row, False))
+        active_row_idx = next((i for i, (_, is_active_row) in enumerate(wrapped_rows) if is_active_row), None)
+        if active_row_idx is None:
+            start = 0
+        else:
+            start = max(0, active_row_idx - (window_size // 2))
+        max_start = max(0, len(wrapped_rows) - window_size)
+        start = min(start, max_start)
+        selected = wrapped_rows[start : start + window_size]
+        rows = [row for row, _ in selected]
 
-        if len(block_lines) > target_rows:
-            active_row_idx = next((i for i, (_, is_active_row) in enumerate(block_lines) if is_active_row), None)
-            if active_row_idx is None:
-                start_row = 0
-            else:
-                start_row = max(0, active_row_idx - (target_rows // 2))
-            max_start = max(0, len(block_lines) - target_rows)
-            start_row = min(start_row, max_start)
-            block_lines = block_lines[start_row : start_row + target_rows]
-        elif len(block_lines) < target_rows:
-            missing = target_rows - len(block_lines)
+        blank_row = _format_row("", is_active=False)
+        if len(rows) < window_size:
+            missing = window_size - len(rows)
             top_pad = missing // 2
             bottom_pad = missing - top_pad
-            block_lines = ([(blank_row, False)] * top_pad) + block_lines + ([(blank_row, False)] * bottom_pad)
+            rows = ([blank_row] * top_pad) + rows + ([blank_row] * bottom_pad)
 
-        desc = "```ansi\n" + "\n".join(row for row, _ in block_lines) + "\n```"
+        desc = "```ansi\n" + "\n".join(rows) + "\n```"
         embed = discord.Embed(title=heading, description=desc)
         return embed
 
@@ -870,6 +912,10 @@ class Music(commands.Cog):
         duration_ms: Optional[int] = None
         album: Optional[str] = None
         spotify_track_id: Optional[str] = None
+        current_title: Optional[str] = None
+        current_artist: Optional[str] = None
+        source_title: Optional[str] = None
+        source_artist: Optional[str] = None
 
         if query and query.strip():
             raw_query = " ".join(str(query).split()).strip()
@@ -890,9 +936,37 @@ class Music(commands.Cog):
                 )
                 return
 
-            title = str(getattr(current, "title", "") or "").strip()
-            artist = str(getattr(current, "author", "") or "").strip()
-            artist = re.sub(r"\s*-\s*topic\s*$", "", artist, flags=re.IGNORECASE).strip() or None
+            current_title = str(getattr(current, "title", "") or "").strip()
+            current_artist = str(getattr(current, "author", "") or "").strip()
+            current_artist = re.sub(r"\s*-\s*topic\s*$", "", current_artist, flags=re.IGNORECASE).strip() or None
+            source_title = self._extract_track_source_title(current)
+            source_artist = self._extract_track_source_artist(current)
+            source_artist = re.sub(r"\s*-\s*topic\s*$", "", str(source_artist or ""), flags=re.IGNORECASE).strip() or None
+
+            if source_title and not self._lyrics_metadata_match(
+                expected_title=source_title,
+                expected_artist=source_artist,
+                actual_title=current_title,
+                actual_artist=current_artist,
+            ):
+                safe_source_title = discord.utils.escape_markdown(source_title, as_needed=True)
+                safe_source_artist = discord.utils.escape_markdown(source_artist or "Unknown Artist", as_needed=True)
+                safe_current_title = discord.utils.escape_markdown(current_title or "Unknown Title", as_needed=True)
+                safe_current_artist = discord.utils.escape_markdown(current_artist or "Unknown Artist", as_needed=True)
+                await self._reply(
+                    interaction,
+                    (
+                        "I detected a resolver mismatch, so I stopped lyrics to avoid showing the wrong song.\n"
+                        f"Expected: **{safe_source_title}** — **{safe_source_artist}**\n"
+                        f"Now playing: **{safe_current_title}** — **{safe_current_artist}**\n"
+                        "Skip/requeue this track, then try lyrics again."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            title = source_title or current_title
+            artist = source_artist or current_artist
             album = self._extract_track_album_name(current)
             spotify_track_id = self._extract_track_spotify_id(current)
             try:
@@ -940,6 +1014,26 @@ class Music(commands.Cog):
             hint = f" for **{title}**" + (f" by **{artist}**" if artist else "")
             await interaction.followup.send(
                 f"Sorry, I couldn't find lyrics{hint} 😭",
+                ephemeral=ephemeral,
+            )
+            return
+
+        if not self._lyrics_metadata_match(
+            expected_title=title,
+            expected_artist=artist,
+            actual_title=result.title,
+            actual_artist=result.artist,
+        ):
+            safe_expected_title = discord.utils.escape_markdown(title or "Unknown Title", as_needed=True)
+            safe_expected_artist = discord.utils.escape_markdown(artist or "Unknown Artist", as_needed=True)
+            safe_result_title = discord.utils.escape_markdown(result.title or "Unknown Title", as_needed=True)
+            safe_result_artist = discord.utils.escape_markdown(result.artist or "Unknown Artist", as_needed=True)
+            await interaction.followup.send(
+                (
+                    "Lyrics lookup returned a different song, so I skipped it.\n"
+                    f"Requested: **{safe_expected_title}** — **{safe_expected_artist}**\n"
+                    f"Found: **{safe_result_title}** — **{safe_result_artist}**"
+                ),
                 ephemeral=ephemeral,
             )
             return
@@ -1375,12 +1469,9 @@ class Music(commands.Cog):
 
         requested_tags = self._extract_version_tags(title)
         candidate_tags = self._extract_version_tags(candidate_title)
+        # Version labels should never be a hard penalty signal.
         if requested_tags:
             score += 9 * len(requested_tags & candidate_tags)
-            score -= 7 * len(requested_tags - candidate_tags)
-            score -= 10 * len(candidate_tags - requested_tags)
-        else:
-            score -= 11 * len(candidate_tags)
 
         if retrieval_score > 0:
             score += retrieval_score * self._resolver_rrf_scale
@@ -1601,6 +1692,8 @@ class Music(commands.Cog):
                     playable,
                     album=getattr(track_obj, "album", None),
                     spotify_track_id=getattr(track_obj, "spotify_track_id", None),
+                    source_title=getattr(track_obj, "title", None),
+                    source_artist=getattr(track_obj, "artist", None),
                 )
                 return idx, playable
             except asyncio.CancelledError:
@@ -2457,6 +2550,8 @@ class Music(commands.Cog):
                     first_playable,
                     album=getattr(first_track, "album", None),
                     spotify_track_id=getattr(first_track, "spotify_track_id", None),
+                    source_title=getattr(first_track, "title", None),
+                    source_artist=getattr(first_track, "artist", None),
                 )
                 
                 if index is not None:
@@ -2587,6 +2682,8 @@ class Music(commands.Cog):
                     playable,
                     album=getattr(track_info, "album", None),
                     spotify_track_id=getattr(track_info, "spotify_track_id", None),
+                    source_title=getattr(track_info, "title", None),
+                    source_artist=getattr(track_info, "artist", None),
                 )
                 
                 if index is not None:
