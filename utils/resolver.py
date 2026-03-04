@@ -69,6 +69,11 @@ class SpotifyResolver:
             "spotify_failure_message", default=""
         )
         self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
+        playlist_ttl_raw = (os.getenv("SPOTIFY_PLAYLIST_CACHE_TTL_SECONDS") or "604800").strip()
+        try:
+            self._playlist_cache_ttl_seconds = max(0, int(playlist_ttl_raw))
+        except ValueError:
+            self._playlist_cache_ttl_seconds = 604_800
         self._ensure_playlist_cache_table()
         
         # Initialize Spotipy if credentials exist
@@ -113,8 +118,10 @@ class SpotifyResolver:
 
     def _db_connect(self) -> sqlite3.Connection:
         os.makedirs(os.path.dirname(self._cache_db_path), exist_ok=True)
-        conn = sqlite3.connect(self._cache_db_path)
+        conn = sqlite3.connect(self._cache_db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _ensure_playlist_cache_table(self) -> None:
@@ -212,7 +219,11 @@ class SpotifyResolver:
             logging.warning(f"Invalid cache timestamp for {playlist_key}; refreshing snapshot.")
             return []
 
-        if datetime.datetime.now() - saved_time < datetime.timedelta(days=7):
+        if self._playlist_cache_ttl_seconds <= 0:
+            logging.info(f"💾 Loaded PLAYLIST from local hard drive cache: {playlist_key}")
+            return tracks
+
+        if datetime.datetime.now() - saved_time < datetime.timedelta(seconds=self._playlist_cache_ttl_seconds):
             logging.info(f"💾 Loaded PLAYLIST from local hard drive cache: {playlist_key}")
             return tracks
 
@@ -817,16 +828,16 @@ class SpotifyResolver:
         try:
             async with self.session.get(url) as response:
                 if response.status != 200:
-                    logging.warning(f"Spotify page fallback returned HTTP {response.status} for {url}")
+                    logging.warning("Spotify page fallback returned HTTP %s for %s", response.status, url)
                     return []
                 html = await response.text()
         except Exception as exc:
-            logging.error(f"Spotify page fallback request failed: {exc}")
+            logging.error("Spotify page fallback request failed: %s", exc)
             return []
 
         tracks = self._extract_tracks_from_session_blob(html)
         if tracks:
-            logging.info(f"🌐 Extracted {len(tracks)} tracks from Spotify page payload.")
+            logging.info("Extracted %d tracks from Spotify page payload.", len(tracks))
             return tracks
 
         deduped_urls = self._extract_music_song_urls(html)
@@ -837,7 +848,7 @@ class SpotifyResolver:
         resolved = await self._resolve_track_urls(deduped_urls)
 
         if resolved:
-            logging.info(f"🌐 Extracted {len(resolved)} tracks from Spotify `music:song` metadata.")
+            logging.info("Extracted %d tracks from Spotify music:song metadata.", len(resolved))
         return resolved
 
     async def get_playlist_tracks(self, url: str, force_update: bool = False, force_cache_bypass: bool = False) -> List[ResolvedTrack]:
@@ -854,16 +865,16 @@ class SpotifyResolver:
         has_api_auth = bool(self._spotify or self._spotify_user_token or self._spotify_refresh_token)
         if has_api_auth:
             try:
-                logging.info(f"🌐 Fetching fresh data from Spotify API for: {playlist_key}")
+                logging.info("Fetching fresh data from Spotify API for: %s", playlist_key)
                 tracks = await self._fetch_via_spotipy(playlist_key)
             except SpotifyException as exc:
                 logging.warning(
                     "Spotify API rejected playlist extraction (status=%s). Falling back to page metadata.",
                     getattr(exc, "http_status", "unknown"),
                 )
-                logging.debug(f"Spotipy exception detail: {exc}")
+                logging.debug("Spotipy exception detail: %s", exc)
             except Exception as exc:
-                logging.error(f"Spotipy exception: {exc}")
+                logging.error("Spotipy exception: %s", exc)
         else:
             logging.warning("Spotipy credentials missing; using Spotify page fallback for playlists/albums.")
             self._set_failure(
@@ -882,7 +893,7 @@ class SpotifyResolver:
         if tracks:
             self._save_playlist_snapshot(playlist_key, tracks)
         else:
-            logging.warning(f"No tracks extracted for {playlist_key}.")
+            logging.warning("No tracks extracted for %s.", playlist_key)
 
         return tracks
 
@@ -892,7 +903,7 @@ class SpotifyResolver:
         try:
             async with self.session.get(odesli_url) as response:
                 if response.status == 200:
-                    data = await response.json()
+                    data = await response.json(content_type=None)
                     # The entityUniqueId points to the primary metadata
                     unique_id = data.get("entityUniqueId")
                     if unique_id and unique_id in data.get("entitiesByUniqueId", {}):
@@ -919,7 +930,7 @@ class SpotifyResolver:
                         spotify_track_id=track_id,
                     )
             except Exception as exc:
-                logging.debug(f"Spotipy single-track lookup failed; falling back to scrape: {exc}")
+                logging.debug("Spotipy single-track lookup failed; falling back to scrape: %s", exc)
                 
         # Scrape fallback for single tracks
         try:

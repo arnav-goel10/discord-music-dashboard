@@ -133,8 +133,10 @@ def _playlist_token_from_url(url: str) -> str:
 
 def _db_connect() -> sqlite3.Connection:
     os.makedirs(_DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(_PLAYLIST_DB_PATH)
+    conn = sqlite3.connect(_PLAYLIST_DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -178,21 +180,23 @@ def _ensure_saved_playlists_storage() -> None:
         return
 
     with _db_connect() as conn:
+        # Drop legacy per-guild table if it exists.
+        conn.execute("DROP TABLE IF EXISTS saved_playlists")
+        conn.execute("DROP TABLE IF EXISTS saved_playlists_v2")
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS saved_playlists (
-                guild_id INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS user_saved_playlists (
                 user_id INTEGER NOT NULL,
                 url TEXT NOT NULL,
                 saved_at INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, user_id, url)
+                PRIMARY KEY (user_id, url)
             )
             """
         )
         conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_saved_playlists_scope_saved_at
-            ON saved_playlists (guild_id, user_id, saved_at DESC)
+            CREATE INDEX IF NOT EXISTS idx_user_saved_playlists_saved_at
+            ON user_saved_playlists (user_id, saved_at DESC)
             """
         )
         conn.commit()
@@ -200,20 +204,19 @@ def _ensure_saved_playlists_storage() -> None:
     _SAVED_PLAYLIST_DB_READY = True
 
 
-def _load_saved_playlists(guild_id: int, user_id: int) -> list[dict[str, Any]]:
-    guild_scope = _normalize_scope_id(guild_id)
+def _load_saved_playlists(user_id: int) -> list[dict[str, Any]]:
     user_scope = _normalize_scope_id(user_id)
     _ensure_saved_playlists_storage()
     with _db_connect() as conn:
         rows = conn.execute(
             """
             SELECT url, saved_at
-            FROM saved_playlists
-            WHERE guild_id = ? AND user_id = ?
+            FROM user_saved_playlists
+            WHERE user_id = ?
             ORDER BY saved_at DESC
             LIMIT ?
             """,
-            (guild_scope, user_scope, _MAX_SAVED_PLAYLISTS),
+            (user_scope, _MAX_SAVED_PLAYLISTS),
         ).fetchall()
 
     parsed = []
@@ -225,30 +228,29 @@ def _load_saved_playlists(guild_id: int, user_id: int) -> list[dict[str, Any]]:
     return _sanitize_saved_playlist_items(parsed)
 
 
-def _save_saved_playlists(guild_id: int, user_id: int, playlists: list[dict[str, Any]]) -> None:
-    guild_scope = _normalize_scope_id(guild_id)
+def _save_saved_playlists(user_id: int, playlists: list[dict[str, Any]]) -> None:
     user_scope = _normalize_scope_id(user_id)
     _ensure_saved_playlists_storage()
     cleaned = _sanitize_saved_playlist_items(playlists)
     with _db_connect() as conn:
         conn.execute(
-            "DELETE FROM saved_playlists WHERE guild_id = ? AND user_id = ?",
-            (guild_scope, user_scope),
+            "DELETE FROM user_saved_playlists WHERE user_id = ?",
+            (user_scope,),
         )
         conn.executemany(
-            "INSERT INTO saved_playlists (guild_id, user_id, url, saved_at) VALUES (?, ?, ?, ?)",
-            [(guild_scope, user_scope, item["url"], int(item["saved_at"])) for item in cleaned],
+            "INSERT INTO user_saved_playlists (user_id, url, saved_at) VALUES (?, ?, ?)",
+            [(user_scope, item["url"], int(item["saved_at"])) for item in cleaned],
         )
         conn.commit()
 
 
-def _upsert_saved_playlist(url: str, guild_id: int, user_id: int) -> tuple[list[dict[str, Any]], bool]:
-    playlists = _load_saved_playlists(guild_id, user_id)
+def _upsert_saved_playlist(url: str, user_id: int) -> tuple[list[dict[str, Any]], bool]:
+    playlists = _load_saved_playlists(user_id)
     playlists = [item for item in playlists if item.get("url") != url]
     playlists.insert(0, {"url": url, "saved_at": int(time.time())})
     trimmed = len(playlists) > _MAX_SAVED_PLAYLISTS
     playlists = playlists[:_MAX_SAVED_PLAYLISTS]
-    _save_saved_playlists(guild_id, user_id, playlists)
+    _save_saved_playlists(user_id, playlists)
     return playlists, trimmed
 
 
@@ -318,12 +320,7 @@ class SavePlaylistModal(discord.ui.Modal, title="Save Spotify Playlist"):
             return
 
         owner_user_id = self.parent_view.owner_user_id if self.parent_view else int(interaction.user.id)
-        owner_guild_id = (
-            self.parent_view.owner_guild_id
-            if self.parent_view
-            else _normalize_scope_id(getattr(getattr(interaction, "guild", None), "id", 0))
-        )
-        playlists, trimmed = _upsert_saved_playlist(url, owner_guild_id, owner_user_id)
+        playlists, trimmed = _upsert_saved_playlist(url, owner_user_id)
         token = _playlist_token_from_url(url)
         if trimmed:
             message = (
@@ -390,7 +387,7 @@ class EditSavedPlaylistModal(discord.ui.Modal, title="Edit Saved Playlist URL"):
             )
 
         deduped = deduped[:_MAX_SAVED_PLAYLISTS]
-        _save_saved_playlists(self.parent_view.owner_guild_id, self.parent_view.owner_user_id, deduped)
+        _save_saved_playlists(self.parent_view.owner_user_id, deduped)
 
         self.parent_view.playlists = deduped
         self.parent_view.selected_index = min(self.index, len(deduped) - 1) if deduped else -1
@@ -400,17 +397,28 @@ class EditSavedPlaylistModal(discord.ui.Modal, title="Edit Saved Playlist URL"):
 
 
 class SavedPlaylistManagerView(discord.ui.View):
-    def __init__(self, dashboard: "SpotifyUI", owner_user_id: int, owner_guild_id: int):
+    def __init__(self, dashboard: "SpotifyUI", owner_user_id: int):
         super().__init__(timeout=180)
         self.dashboard = dashboard
         self.owner_user_id = int(owner_user_id)
-        self.owner_guild_id = _normalize_scope_id(owner_guild_id)
-        self.playlists: list[dict[str, Any]] = _load_saved_playlists(self.owner_guild_id, self.owner_user_id)
+        self.playlists: list[dict[str, Any]] = _load_saved_playlists(self.owner_user_id)
         self.selected_index: int = 0 if self.playlists else -1
         default_order = str(getattr(self.dashboard, "_saved_playlist_order", "recent") or "recent")
         self.play_order = default_order if default_order in {"recent", "spotify"} else "recent"
         self.message: Optional[discord.Message] = None
         self._sync_components()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(getattr(interaction.user, "id", 0)) == self.owner_user_id:
+            return True
+        try:
+            await interaction.response.send_message(
+                "Only the person who opened this playlist manager can use it.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+        return False
 
     def _order_label(self) -> str:
         return "Recently Added" if self.play_order == "recent" else "Spotify Order"
@@ -564,7 +572,7 @@ class SavedPlaylistManagerView(discord.ui.View):
             return
 
         removed = self.playlists.pop(self.selected_index)
-        _save_saved_playlists(self.owner_guild_id, self.owner_user_id, self.playlists)
+        _save_saved_playlists(self.owner_user_id, self.playlists)
 
         if self.playlists:
             self.selected_index = min(self.selected_index, len(self.playlists) - 1)
@@ -607,6 +615,12 @@ class VolumeModal(discord.ui.Modal, title="Set Volume"):
             return
 
         await player.set_volume(value)
+        music_cog = _get_music_cog(interaction)
+        if music_cog and hasattr(music_cog, "_remember_player_volume"):
+            try:
+                music_cog._remember_player_volume(player, value)
+            except Exception:
+                pass
         await interaction.response.send_message(f"Volume set to **{value}%**.", ephemeral=True)
         await self.parent_view.update_player_message(force=True)
 
@@ -1042,6 +1056,10 @@ class SpotifyUI(_DashboardBaseView):
         super().__init__(timeout=None)
         self.player = player
         self.message: Optional[discord.Message] = None
+        self._render_lock = asyncio.Lock()
+        self._rebind_lock = asyncio.Lock()
+        self._last_rebind_attempt_at: float = 0.0
+        self._has_ever_bound_message: bool = False
         self._use_v2_layout = _HAS_LAYOUT_V2
         self._v2_header_container = None
         self._v2_section = None
@@ -1053,11 +1071,11 @@ class SpotifyUI(_DashboardBaseView):
         self._position_anchor_ms: int = int(getattr(player, "position", 0) or 0)
         self._position_anchor_at: float = time.monotonic()
         self._position_anchor_track_key: str = self._track_key(player.current)
-        refresh_raw = (os.getenv("UI_REFRESH_INTERVAL_SECONDS") or "0.49").strip()
+        refresh_raw = (os.getenv("UI_REFRESH_INTERVAL_SECONDS") or "0.70").strip()
         try:
-            self._refresh_interval = max(0.49, float(refresh_raw))
+            self._refresh_interval = max(0.55, float(refresh_raw))
         except ValueError:
-            self._refresh_interval = 0.49
+            self._refresh_interval = 0.70
         self._setup_controls_for_layout_if_needed()
         self._setup_v2_layout_shell()
         self._reorder_fallback_controls_if_needed()
@@ -1428,14 +1446,85 @@ class SpotifyUI(_DashboardBaseView):
         try:
             while True:
                 await asyncio.sleep(self._refresh_interval)
+                # Stop the refresh loop if the player is no longer connected to voice.
+                # This prevents ghost dashboards from being re-created after /stop.
+                guild = getattr(self.player, "guild", None)
+                if guild and not guild.voice_client:
+                    return
                 if not self.message:
+                    # Don't self-heal before the dashboard has ever been posted.
+                    # During initial creation, message send/edit can take longer than
+                    # one refresh tick; rebinding here would create a duplicate panel.
+                    if not self._has_ever_bound_message:
+                        continue
+                    # Self-heal if the dashboard message disappeared.
+                    await self._rebind_dashboard_message()
                     continue
+                if not self._has_ever_bound_message:
+                    self._has_ever_bound_message = True
                 try:
                     await self.update_player_message()
                 except Exception as exc:
                     logging.debug("Dashboard auto-refresh error (continuing): %s", exc)
         except asyncio.CancelledError:
             return
+
+    async def _rebind_dashboard_message(self) -> None:
+        async with self._rebind_lock:
+            if self.message:
+                return
+
+            now = time.monotonic()
+            if now - self._last_rebind_attempt_at < 8.0:
+                return
+            self._last_rebind_attempt_at = now
+
+            # If player still points to a valid dashboard message, recover it
+            # instead of creating a second dashboard.
+            existing_message = getattr(self.player, "ui_message", None)
+            if existing_message:
+                try:
+                    if self._use_v2_layout:
+                        await existing_message.edit(view=self)
+                    else:
+                        await existing_message.edit(embed=self.build_embed(), view=self)
+                    self.message = existing_message
+                    self._has_ever_bound_message = True
+                    self._last_render_key = None
+                    return
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException as exc:
+                    logging.debug("Dashboard rebind could not reuse existing message: %s", exc)
+                except Exception as exc:
+                    logging.debug("Dashboard rebind reuse failed unexpectedly: %s", exc)
+
+            home = getattr(self.player, "home", None)
+            if not home:
+                return
+
+            try:
+                if self._use_v2_layout:
+                    msg = await home.send(view=self)
+                else:
+                    msg = await home.send(embed=self.build_embed(), view=self)
+            except Exception as exc:
+                logging.debug("Dashboard rebind failed: %s", exc)
+                return
+
+            old_message = self.message
+            self.message = msg
+            self._has_ever_bound_message = True
+            try:
+                setattr(self.player, "ui_message", msg)
+            except Exception:
+                pass
+
+            if old_message and getattr(old_message, "id", None) != getattr(msg, "id", None):
+                try:
+                    await old_message.delete()
+                except Exception:
+                    pass
 
     def stop(self) -> None:
         if self._refresh_task and not self._refresh_task.done():
@@ -1459,7 +1548,7 @@ class SpotifyUI(_DashboardBaseView):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return True
+            return False
 
         channel = getattr(self.player, "channel", None)
         # If the player is currently disconnected, still allow controls like Add/Lists.
@@ -1500,22 +1589,42 @@ class SpotifyUI(_DashboardBaseView):
         if not self.message:
             return
 
-        new_key = self._render_state_key()
-        if not force and self._last_render_key == new_key:
-            return
+        should_rebind = False
+        async with self._render_lock:
+            if not self.message:
+                return
+            self._has_ever_bound_message = True
 
-        self._sync_components()
-        try:
-            if self._use_v2_layout:
-                await self.message.edit(view=self)
-            else:
-                embed = self.build_embed()
-                await self.message.edit(embed=embed, view=self)
-            self._last_render_key = new_key
-        except discord.NotFound:
-            self.message = None
-        except discord.HTTPException as exc:
-            logging.debug("Dashboard refresh skipped due to HTTP error: %s", exc)
+            new_key = self._render_state_key()
+            if not force and self._last_render_key == new_key:
+                return
+
+            self._sync_components()
+            try:
+                if self._use_v2_layout:
+                    await asyncio.wait_for(self.message.edit(view=self), timeout=8.0)
+                else:
+                    embed = self.build_embed()
+                    await asyncio.wait_for(self.message.edit(embed=embed, view=self), timeout=8.0)
+                self._last_render_key = new_key
+            except asyncio.TimeoutError:
+                self._last_render_key = None
+                logging.debug("Dashboard refresh timed out; keeping current message.")
+            except discord.NotFound:
+                self.message = None
+                self._last_render_key = None
+                should_rebind = True
+            except discord.HTTPException as exc:
+                self._last_render_key = None
+                if int(getattr(exc, "code", 0) or 0) == 10008:
+                    # Unknown message: dashboard was removed. Trigger rebind.
+                    self.message = None
+                    should_rebind = True
+                else:
+                    logging.debug("Dashboard refresh skipped due to transient HTTP error: %s", exc)
+
+        if should_rebind:
+            await self._rebind_dashboard_message()
 
     def _active_filter_name(self) -> str:
         preset_names = {
@@ -1619,7 +1728,14 @@ class SpotifyUI(_DashboardBaseView):
             else:
                 await player.pause(True)
         elif not player.queue.is_empty:
-            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+            volume_to_use = int(getattr(player, "volume", 15))
+            music_cog = _get_music_cog(interaction)
+            if music_cog and hasattr(music_cog, "_effective_player_volume"):
+                try:
+                    volume_to_use = music_cog._effective_player_volume(player)
+                except Exception:
+                    pass
+            await player.play(player.queue.get(), volume=volume_to_use)
             if player.paused:
                 try:
                     await player.pause(False)
@@ -1707,7 +1823,7 @@ class SpotifyUI(_DashboardBaseView):
         if not music_cog or not hasattr(music_cog, "_send_current_lyrics"):
             await interaction.response.send_message("Lyrics are temporarily unavailable.", ephemeral=True)
             return
-        await music_cog._send_current_lyrics(interaction, ephemeral=True)
+        await music_cog._send_current_lyrics(interaction, ephemeral=False)
 
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="Q", row=1)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1725,7 +1841,6 @@ class SpotifyUI(_DashboardBaseView):
         view = SavedPlaylistManagerView(
             self,
             owner_user_id=int(interaction.user.id),
-            owner_guild_id=_normalize_scope_id(getattr(getattr(interaction, "guild", None), "id", 0)),
         )
         await interaction.response.send_message(
             content=view._build_content(),
@@ -1741,6 +1856,12 @@ class SpotifyUI(_DashboardBaseView):
     async def volume_set(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         player = self._live_player(interaction)
         current_volume = int(getattr(player, "volume", 15)) if player else 15
+        music_cog = _get_music_cog(interaction)
+        if player and music_cog and hasattr(music_cog, "_effective_player_volume"):
+            try:
+                current_volume = music_cog._effective_player_volume(player)
+            except Exception:
+                pass
         await interaction.response.send_modal(VolumeModal(self, current_volume=current_volume))
 
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="Fx", row=1)

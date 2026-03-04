@@ -10,10 +10,13 @@ import json
 import sqlite3
 import time
 import datetime
-import difflib
 import math
-import textwrap
+import unicodedata
 from typing import cast, Optional, Any
+
+from rapidfuzz import fuzz as rfuzz
+from rapidfuzz.distance import JaroWinkler
+from unidecode import unidecode
 
 from utils.patched_player import DAVECompatiblePlayer
 
@@ -82,15 +85,23 @@ class LyricsPaginatorView(discord.ui.View):
 
 class Music(commands.Cog):
     _TRACK_VERSION_PATTERNS: dict[str, tuple[str, ...]] = {
-        "live": (r"\blive\b", r"\bunplugged\b", r"\bsession\b"),
-        "cover": (r"\bcover\b",),
-        "karaoke": (r"\bkaraoke\b",),
-        "instrumental": (r"\binstrumental\b",),
-        "acoustic": (r"\bacoustic\b", r"\bstripped\b"),
-        "remix": (r"\bremix\b", r"\brework\b", r"\bvip\b", r"\bedit\b", r"\boriginal mix\b", r"\bextended mix\b"),
+        "live": (r"\blive\b", r"\bunplugged\b", r"\bsession\b", r"\bconcert\b", r"\bin concert\b"),
+        "cover": (r"\bcover\b", r"\btribute\b"),
+        "karaoke": (r"\bkaraoke\b", r"\bsing[\- ]?along\b"),
+        "instrumental": (r"\binstrumental\b", r"\binst\b", r"\bno vocals?\b"),
+        "acoustic": (r"\bacoustic\b", r"\bstripped\b", r"\bbare\b"),
+        "remix": (
+            r"\bremix\b", r"\brework\b", r"\bvip\b", r"\bedit\b(?!\s+version)",
+            r"\boriginal mix\b", r"\bextended mix\b", r"\bdub mix\b",
+            r"\bclub mix\b", r"\bradio mix\b", r"\bbootleg\b",
+        ),
         "nightcore": (r"\bnightcore\b",),
-        "slowed": (r"\bslowed\b", r"\breverb\b", r"\bchopped\b", r"\bsped up\b"),
+        "slowed": (r"\bslowed\b", r"\breverb\b", r"\bchopped\b", r"\bsped up\b", r"\blo[\- ]?fi\b"),
         "tiktok": (r"\btiktok\b",),
+        "radio_edit": (r"\bradio edit\b", r"\bradio version\b", r"\bsingle version\b"),
+        "remaster": (r"\bremaster(?:ed)?\b", r"\b\d{4}\s*remaster\b"),
+        "demo": (r"\bdemo\b",),
+        "clean": (r"\bclean\b(?!\s+bandit)",),
     }
 
     def __init__(self, bot: commands.Bot):
@@ -101,6 +112,8 @@ class Music(commands.Cog):
         self._exception_last_at: dict[int, float] = {}
         self._playlist_load_tasks: dict[int, asyncio.Task] = {}
         self._queue_busy_reason: dict[int, str] = {}
+        self._queue_busy_progress: dict[int, tuple[int, int]] = {}
+        self._dashboard_opening: set[int] = set()
         self._awaiting_autoplay: dict[int, asyncio.Event] = {}
         self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
         self._resolved_links_cache_enabled = (
@@ -111,6 +124,16 @@ class Music(commands.Cog):
             self._resolved_links_cache_ttl_seconds = max(0, int(ttl_raw))
         except ValueError:
             self._resolved_links_cache_ttl_seconds = 2_592_000
+        user_ttl_raw = os.getenv("TRACK_RESOLVER_USER_CACHE_TTL_SECONDS", "86400").strip()
+        playlist_ttl_raw = os.getenv("TRACK_RESOLVER_PLAYLIST_CACHE_TTL_SECONDS", "604800").strip()
+        try:
+            self._resolver_user_cache_ttl_seconds = max(0, int(user_ttl_raw))
+        except ValueError:
+            self._resolver_user_cache_ttl_seconds = 86_400
+        try:
+            self._resolver_playlist_cache_ttl_seconds = max(0, int(playlist_ttl_raw))
+        except ValueError:
+            self._resolver_playlist_cache_ttl_seconds = 604_800
         self._ensure_resolved_links_cache_table()
         self._resolved_links_cache = self._load_resolved_links_cache()
         self._resolver_rrf_k = self._env_int("TRACK_RESOLVER_RRF_K", 20, minimum=1)
@@ -135,12 +158,51 @@ class Music(commands.Cog):
         self._ml_reranker_load_failed = False
         self._ml_reranker_lock = asyncio.Lock()
         self._live_lyrics_tasks: dict[int, asyncio.Task] = {}
+        self._lyrics_auto_delete_tasks: dict[int, asyncio.Task] = {}
+        self._default_player_volume = self._env_int("DEFAULT_PLAYER_VOLUME", 15, minimum=0, maximum=100)
 
     def cog_unload(self):
+        self._cancel_all_live_lyrics()
+
+    def _cancel_all_live_lyrics(self) -> None:
         for task in list(self._live_lyrics_tasks.values()):
             if task and not task.done():
                 task.cancel()
         self._live_lyrics_tasks.clear()
+        for task in list(self._lyrics_auto_delete_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._lyrics_auto_delete_tasks.clear()
+
+    @staticmethod
+    def _clamp_volume(value: int) -> int:
+        return max(0, min(100, int(value)))
+
+    def _effective_player_volume(self, player: wavelink.Player) -> int:
+        preferred = getattr(player, "ui_session_volume", None)
+        if preferred is not None:
+            return self._clamp_volume(preferred)
+        return self._default_player_volume
+
+    def _remember_player_volume(self, player: wavelink.Player, volume: int) -> None:
+        remembered = self._clamp_volume(volume)
+        try:
+            setattr(player, "ui_session_volume", remembered)
+        except Exception:
+            pass
+
+    async def _apply_preferred_volume(self, player: wavelink.Player, *, force: bool = False) -> None:
+        target = self._effective_player_volume(player)
+        try:
+            current = int(getattr(player, "volume", target) or target)
+        except (TypeError, ValueError):
+            current = target
+        current = self._clamp_volume(current)
+        if not force and current == target:
+            return
+        await player.set_volume(target)
+        self._remember_player_volume(player, target)
+
 
     @staticmethod
     def _env_bool(name: str, default: bool = False) -> bool:
@@ -191,35 +253,43 @@ class Music(commands.Cog):
         query: str,
         title: Optional[str] = None,
         artist: Optional[str] = None,
-        duration_ms: Optional[int] = None,
         isrc: Optional[str] = None,
+        cache_scope: str = "user",
     ) -> list[str]:
         keys: list[str] = []
+        scope = "playlist" if str(cache_scope).strip().lower() == "playlist" else "user"
+        scope_prefix = "p::" if scope == "playlist" else "u::"
 
         def add(raw: Optional[str]) -> None:
             key = self._normalize_cache_key(raw)
-            if key and key not in keys:
-                keys.append(key)
+            scoped = f"{scope_prefix}{key}" if key else ""
+            if scoped and scoped not in keys:
+                keys.append(scoped)
 
         add(query)
         if title and artist:
             add(f"{title} - {artist}")
             add(f"{title} {artist}")
-        if title:
-            add(title)
-        if artist:
-            add(artist)
-        if duration_ms and int(duration_ms) > 0:
-            add(f"duration:{int(duration_ms) // 1000}")
         if isrc:
             add(f"isrc:{str(isrc).strip().upper()}")
 
         return keys
 
+    def _resolved_cache_ttl_seconds_for_key(self, key: str) -> int:
+        raw = str(key or "").strip().lower()
+        if raw.startswith("p::"):
+            return self._resolver_playlist_cache_ttl_seconds
+        if raw.startswith("u::"):
+            return self._resolver_user_cache_ttl_seconds
+        # Legacy, unscoped keys fallback.
+        return self._resolved_links_cache_ttl_seconds
+
     def _resolved_links_db_connect(self) -> sqlite3.Connection:
         os.makedirs(os.path.dirname(self._cache_db_path), exist_ok=True)
-        conn = sqlite3.connect(self._cache_db_path)
+        conn = sqlite3.connect(self._cache_db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _ensure_resolved_links_cache_table(self) -> None:
@@ -300,7 +370,8 @@ class Music(commands.Cog):
                 if key:
                     stale_keys.append(key)
                 continue
-            if self._resolved_links_cache_ttl_seconds > 0 and (now - updated_at) > self._resolved_links_cache_ttl_seconds:
+            ttl_seconds = self._resolved_cache_ttl_seconds_for_key(key)
+            if ttl_seconds > 0 and (now - updated_at) > ttl_seconds:
                 stale_keys.append(key)
                 continue
             parsed[key] = {"uri": uri, "updated_at": updated_at}
@@ -349,7 +420,8 @@ class Music(commands.Cog):
                 stale_keys.append(key)
                 continue
 
-            if self._resolved_links_cache_ttl_seconds > 0 and updated_at and (now - updated_at) > self._resolved_links_cache_ttl_seconds:
+            ttl_seconds = self._resolved_cache_ttl_seconds_for_key(key)
+            if ttl_seconds > 0 and updated_at and (now - updated_at) > ttl_seconds:
                 self._resolved_links_cache.pop(key, None)
                 stale_keys.append(key)
                 continue
@@ -420,39 +492,44 @@ class Music(commands.Cog):
 
         if created_player:
             try:
-                await player.set_volume(15)
+                await self._apply_preferred_volume(player, force=True)
             except Exception as exc:
-                logging.debug("Failed to set default volume on new dashboard player: %s", exc)
+                logging.debug("Failed to set preferred volume on new dashboard player: %s", exc)
 
         player.home = interaction.channel
         player.autoplay = wavelink.AutoPlayMode.partial
+        scope_id = self._player_scope_id(player)
+        self._dashboard_opening.add(scope_id)
 
         from .ui import SpotifyUI
 
-        # Keep one active dashboard message per player.
-        if getattr(player, "ui_view", None):
-            try:
-                player.ui_view.stop()
-            except Exception as exc:
-                logging.debug("Failed to stop previous dashboard view: %s", exc)
-        if getattr(player, "ui_message", None):
-            try:
-                await player.ui_message.delete()
-            except discord.NotFound:
-                pass
-            except Exception as exc:
-                logging.debug("Failed to delete previous dashboard message: %s", exc)
+        try:
+            # Keep one active dashboard message per player.
+            if getattr(player, "ui_view", None):
+                try:
+                    player.ui_view.stop()
+                except Exception as exc:
+                    logging.debug("Failed to stop previous dashboard view: %s", exc)
+            if getattr(player, "ui_message", None):
+                try:
+                    await player.ui_message.delete()
+                except discord.NotFound:
+                    pass
+                except Exception as exc:
+                    logging.debug("Failed to delete previous dashboard message: %s", exc)
 
-        view = SpotifyUI(player)
-        if getattr(view, "uses_v2_layout", False):
-            msg = await interaction.followup.send(view=view, wait=True)
-        else:
-            embed = view.build_embed()
-            msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+            view = SpotifyUI(player)
+            if getattr(view, "uses_v2_layout", False):
+                msg = await interaction.followup.send(view=view, wait=True)
+            else:
+                embed = view.build_embed()
+                msg = await interaction.followup.send(embed=embed, view=view, wait=True)
 
-        player.ui_view = view
-        player.ui_message = msg
-        view.message = msg
+            player.ui_view = view
+            player.ui_message = msg
+            view.message = msg
+        finally:
+            self._dashboard_opening.discard(scope_id)
 
     @staticmethod
     def _is_url(query: str) -> bool:
@@ -596,6 +673,23 @@ class Music(commands.Cog):
             getattr(extras, "spotify_id", None),
             getattr(extras, "track_id", None),
         )
+
+    @staticmethod
+    def _build_lyrics_stream_cache_key(track: Any) -> Optional[str]:
+        if not track:
+            return None
+        source = str(getattr(track, "source", "") or getattr(track, "source_name", "")).strip().lower() or "unknown"
+        identifier = str(getattr(track, "identifier", "") or "").strip()
+        uri = str(getattr(track, "uri", "") or "").strip().lower()
+        if identifier:
+            return f"{source}:{identifier.lower()}"
+        if uri:
+            return f"{source}:{uri}"
+        title = str(getattr(track, "title", "") or "").strip().lower()
+        author = str(getattr(track, "author", "") or "").strip().lower()
+        if title:
+            return f"{source}:{title}:{author}"
+        return None
 
     @staticmethod
     def _extract_track_source_title(track: Any) -> Optional[str]:
@@ -791,64 +885,147 @@ class Music(commands.Cog):
 
         window_size = 15
         # Keep a strict fixed-size viewport to avoid frame-to-frame jitter.
-        # Long lyric lines can wrap, but the rendered viewport remains fixed.
-        width = 57
-        content_width = width - 2
-        reset = "\u001b[0m"
-        active_color = "\u001b[1;36m"
+        # Wrapping/padding is based on visible column width (not Python len()),
+        # so lines with wide/combined glyphs stay stable.
+        try:
+            width_cap = int((os.getenv("LIVE_LYRICS_WIDTH") or "50").strip())
+        except ValueError:
+            width_cap = 50
+        width_cap = max(34, min(57, width_cap))
+        try:
+            width_min = int((os.getenv("LIVE_LYRICS_MIN_WIDTH") or "38").strip())
+        except ValueError:
+            width_min = 38
+        width_min = max(30, min(width_cap, width_min))
+        # Keep arrow gutters fixed so wrapping does not shift on highlight changes.
+        active_prefix = "▶ "
+        active_suffix = " ◀"
+        inactive_prefix = "  "
+        inactive_suffix = "  "
+
+        def _char_width(ch: str) -> int:
+            if not ch:
+                return 0
+            if unicodedata.combining(ch):
+                return 0
+            if unicodedata.east_asian_width(ch) in {"F", "W"}:
+                return 2
+            return 1
+
+        def _visible_width(text: str) -> int:
+            return sum(_char_width(ch) for ch in text)
 
         def _clip_ellipsis(text: str, limit: int) -> str:
-            if len(text) <= limit:
+            if limit <= 0:
+                return ""
+            if _visible_width(text) <= limit:
                 return text
-            if limit <= 1:
-                return text[:limit]
-            return text[: limit - 1].rstrip() + "…"
+            ellipsis = "…"
+            ellipsis_w = _visible_width(ellipsis)
+            if limit <= ellipsis_w:
+                return ellipsis
+            out: list[str] = []
+            used = 0
+            for ch in text:
+                w = _char_width(ch)
+                if used + w + ellipsis_w > limit:
+                    break
+                out.append(ch)
+                used += w
+            return "".join(out).rstrip() + ellipsis
 
-        def _center_visible(text: str, target: int) -> str:
-            if len(text) >= target:
+        def _align_visible(text: str, target: int, center: bool = False) -> str:
+            width_now = _visible_width(text)
+            if width_now >= target:
                 return text
-            total_pad = target - len(text)
-            left = total_pad // 2
-            right = total_pad - left
-            return f"{' ' * left}{text}{' ' * right}"
+            total_pad = target - width_now
+            if center:
+                left = total_pad // 2
+                right = total_pad - left
+                return f"{' ' * left}{text}{' ' * right}"
+            return f"{text}{' ' * total_pad}"
+
+        def _split_word_by_width(word: str, limit: int) -> list[str]:
+            if not word:
+                return [""]
+            chunks: list[str] = []
+            current: list[str] = []
+            current_w = 0
+            for ch in word:
+                ch_w = _char_width(ch)
+                if current and current_w + ch_w > limit:
+                    chunks.append("".join(current))
+                    current = [ch]
+                    current_w = ch_w
+                else:
+                    current.append(ch)
+                    current_w += ch_w
+            if current:
+                chunks.append("".join(current))
+            return chunks or [""]
 
         def _wrap_clean(text: str, limit: int) -> list[str]:
             if limit <= 1:
                 return [text[:1]] if text else [""]
-            wrapped = textwrap.wrap(
-                text,
-                width=limit,
-                break_long_words=True,
-                break_on_hyphens=False,
-            )
+            clean = " ".join(text.split())
+            if not clean:
+                return [""]
+            wrapped: list[str] = []
+            current = ""
+            for word in clean.split(" "):
+                if not word:
+                    continue
+                if _visible_width(word) > limit:
+                    if current:
+                        wrapped.append(current)
+                        current = ""
+                    wrapped.extend(_split_word_by_width(word, limit))
+                    continue
+                candidate = word if not current else f"{current} {word}"
+                if _visible_width(candidate) <= limit:
+                    current = candidate
+                else:
+                    wrapped.append(current)
+                    current = word
+            if current:
+                wrapped.append(current)
             return wrapped or [""]
 
+        def _sanitize_live_line(raw: str) -> str:
+            text = " ".join(str(raw or "").split())
+            # Keep fenced code block stable by avoiding accidental fence delimiters.
+            return text.replace("```", "'''")
+
+        gutter_width = len(active_prefix) + len(active_suffix)
+        max_inner_width = max(8, width_cap - 2 - gutter_width)
+        min_inner_width = max(8, width_min - 2 - gutter_width)
+        heading_visible = _visible_width(_sanitize_live_line(heading))
+        longest_lyric_visible = max((_visible_width(_sanitize_live_line(line)) for _, line in lines), default=0)
+        row_inner_width = max(min_inner_width, min(max_inner_width, max(heading_visible, longest_lyric_visible)))
+        content_width = row_inner_width + gutter_width
+        width = content_width + 2
+
         def _format_row(text: str, *, is_active: bool) -> str:
-            clean = " ".join(text.split())
+            clean = _sanitize_live_line(text)
+            clipped = _clip_ellipsis(clean, row_inner_width)
+            centered = _align_visible(clipped, row_inner_width, center=True)
             if is_active:
-                inner = content_width - 4  # "▶ " + text + " ◀"
-                clipped = _clip_ellipsis(clean, inner)
-                centered = _center_visible(clipped, inner)
-                return f"{active_color} ▶ {centered} ◀ {reset}"
-            clipped = _clip_ellipsis(clean, content_width)
-            centered = _center_visible(clipped, content_width)
-            return f" {centered} "
+                return f"{active_prefix}{centered}{active_suffix}"
+            return f"{inactive_prefix}{centered}{inactive_suffix}"
 
         wrapped_rows: list[tuple[str, bool]] = []
         for idx, (_, line) in enumerate(lines):
-            text = discord.utils.escape_markdown(line, as_needed=True)
-            clean = " ".join(text.split())
+            clean = _sanitize_live_line(line)
             if idx == active_index:
-                inner = content_width - 4
-                for chunk_idx, chunk in enumerate(_wrap_clean(clean, inner)):
-                    centered = _center_visible(_clip_ellipsis(chunk, inner), inner)
+                for chunk_idx, chunk in enumerate(_wrap_clean(clean, row_inner_width)):
+                    centered = _align_visible(_clip_ellipsis(chunk, row_inner_width), row_inner_width, center=True)
                     if chunk_idx == 0:
-                        row = f"{active_color} ▶ {centered} ◀ {reset}"
+                        row = f"{active_prefix}{centered}{active_suffix}"
                     else:
-                        row = f"{active_color}   {centered}   {reset}"
+                        row = f"{inactive_prefix}{centered}{inactive_suffix}"
                     wrapped_rows.append((row, True))
             else:
-                for chunk in _wrap_clean(clean, content_width):
+                for chunk in _wrap_clean(clean, row_inner_width):
                     wrapped_rows.append((_format_row(chunk, is_active=False), False))
 
         if not wrapped_rows:
@@ -871,9 +1048,8 @@ class Music(commands.Cog):
             bottom_pad = missing - top_pad
             rows = ([blank_row] * top_pad) + rows + ([blank_row] * bottom_pad)
 
-        desc = "```ansi\n" + "\n".join(rows) + "\n```"
-        embed = discord.Embed(title=heading, description=desc)
-        return embed
+        block = "```\n" + "\n".join(rows) + "\n```"
+        return discord.Embed(title=heading, description=block, color=0x2B2D31)
 
     def _build_lyrics_embeds(
         self,
@@ -894,7 +1070,7 @@ class Music(commands.Cog):
 
         for idx, chunk in enumerate(pages, start=1):
             title_text = heading if total_pages == 1 else f"{heading} ({idx}/{total_pages})"
-            embed = discord.Embed(title=title_text, description=chunk or "_(No lyrics text)_")
+            embed = discord.Embed(title=title_text, description=chunk or "_(No lyrics text)_", color=0x2B2D31)
             embeds.append(embed)
 
         return embeds
@@ -912,6 +1088,7 @@ class Music(commands.Cog):
         duration_ms: Optional[int] = None
         album: Optional[str] = None
         spotify_track_id: Optional[str] = None
+        stream_cache_key: Optional[str] = None
         current_title: Optional[str] = None
         current_artist: Optional[str] = None
         source_title: Optional[str] = None
@@ -969,6 +1146,7 @@ class Music(commands.Cog):
             artist = source_artist or current_artist
             album = self._extract_track_album_name(current)
             spotify_track_id = self._extract_track_spotify_id(current)
+            stream_cache_key = self._build_lyrics_stream_cache_key(current)
             try:
                 duration_ms = int(getattr(current, "length", 0) or 0)
             except (TypeError, ValueError):
@@ -1009,6 +1187,7 @@ class Music(commands.Cog):
             duration_ms=duration_ms,
             album=album,
             spotify_track_id=spotify_track_id,
+            stream_cache_key=stream_cache_key,
         )
         if not result:
             hint = f" for **{title}**" + (f" by **{artist}**" if artist else "")
@@ -1064,6 +1243,7 @@ class Music(commands.Cog):
                     anchor_ms=anchor_ms,
                     anchor_at=anchor_at,
                     initial_index=active_index,
+                    delete_when_done=True,
                 )
             )
             self._live_lyrics_tasks[id(sent)] = task
@@ -1079,20 +1259,72 @@ class Music(commands.Cog):
         )
 
         if len(embeds) == 1:
-            await interaction.followup.send(embed=embeds[0], ephemeral=ephemeral)
+            sent = await interaction.followup.send(embed=embeds[0], ephemeral=ephemeral, wait=True)
+            if player and current_track and not query and not ephemeral:
+                self._schedule_lyrics_auto_delete(message=sent, player=player, track_key=self._track_identity(current_track))
             return
 
         view = LyricsPaginatorView(embeds, owner_id=int(interaction.user.id))
         sent = await interaction.followup.send(embed=embeds[0], view=view, ephemeral=ephemeral, wait=True)
         view.message = sent
+        if player and current_track and not query and not ephemeral:
+            self._schedule_lyrics_auto_delete(message=sent, player=player, track_key=self._track_identity(current_track))
 
     async def _send_current_lyrics(
         self,
         interaction: discord.Interaction,
         *,
-        ephemeral: bool = True,
+        ephemeral: bool = False,
     ) -> None:
         await self._send_lyrics(interaction, query=None, ephemeral=ephemeral)
+
+    def _schedule_lyrics_auto_delete(
+        self,
+        *,
+        message: discord.Message,
+        player: wavelink.Player,
+        track_key: str,
+    ) -> None:
+        msg_id = int(getattr(message, "id", 0) or 0)
+        if msg_id <= 0:
+            return
+        existing = self._lyrics_auto_delete_tasks.pop(msg_id, None)
+        if existing and not existing.done():
+            existing.cancel()
+        task = asyncio.create_task(
+            self._run_lyrics_auto_delete(
+                message=message,
+                player=player,
+                track_key=track_key,
+            )
+        )
+        self._lyrics_auto_delete_tasks[msg_id] = task
+
+    async def _run_lyrics_auto_delete(
+        self,
+        *,
+        message: discord.Message,
+        player: wavelink.Player,
+        track_key: str,
+    ) -> None:
+        msg_id = int(getattr(message, "id", 0) or 0)
+        try:
+            while True:
+                current_track = getattr(player, "current", None)
+                if not current_track:
+                    break
+                if self._track_identity(current_track) != track_key:
+                    break
+                await asyncio.sleep(0.8)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if msg_id > 0:
+                self._lyrics_auto_delete_tasks.pop(msg_id, None)
+            try:
+                await message.delete()
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
     async def _run_live_lyrics_updates(
         self,
@@ -1106,9 +1338,14 @@ class Music(commands.Cog):
         anchor_ms: int,
         anchor_at: float,
         initial_index: int = -2,
+        delete_when_done: bool = False,
     ) -> None:
         last_idx = initial_index
-        poll_interval = 0.4
+        poll_raw = (os.getenv("LIVE_LYRICS_POLL_INTERVAL_SECONDS") or "0.65").strip()
+        try:
+            poll_interval = max(0.35, float(poll_raw))
+        except ValueError:
+            poll_interval = 0.65
         try:
             while True:
                 current_track = getattr(player, "current", None)
@@ -1132,14 +1369,14 @@ class Music(commands.Cog):
                     idx = last_idx + 1
                 if idx != last_idx:
                     last_idx = idx
-                    embed = self._build_live_lyrics_embed(
+                    live_embed = self._build_live_lyrics_embed(
                         title=title,
                         artist=artist,
                         lines=lines,
                         active_index=idx,
                     )
                     try:
-                        await message.edit(embed=embed)
+                        await message.edit(embed=live_embed)
                     except discord.NotFound:
                         break
                     except discord.HTTPException:
@@ -1149,6 +1386,11 @@ class Music(commands.Cog):
             raise
         finally:
             self._live_lyrics_tasks.pop(id(message), None)
+            if delete_when_done:
+                try:
+                    await message.delete()
+                except (discord.NotFound, discord.HTTPException):
+                    pass
 
     @staticmethod
     def _build_query_variants(query: str, *, title: Optional[str] = None, artist: Optional[str] = None) -> list[str]:
@@ -1186,23 +1428,67 @@ class Music(commands.Cog):
     @staticmethod
     def _normalize_match_string(raw: Optional[str]) -> str:
         text = str(raw or "").lower()
-        text = text.replace("’", "'")
+        text = text.replace("\u2019", "'").replace("\u2018", "'").replace("\u201c", '"').replace("\u201d", '"')
+        # NFKD decomposition: splits accented chars into base + combining mark
+        text = unicodedata.normalize("NFKD", text)
+        # Strip combining diacritical marks (accents, tildes, etc.)
+        text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+        # NFC recomposition
+        text = unicodedata.normalize("NFC", text)
         text = re.sub(r"[\(\[].*?[\)\]]", " ", text)
         text = re.sub(
-            r"\b(official|audio|video|lyrics?|lyric|remastered|remaster|hd|4k|hq|visualizer)\b",
+            r"\b(official|audio|video|lyrics?|lyric|remastered|remaster|hd|4k|hq|visualizer|topic|vevo)\b",
             " ",
             text,
         )
-        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        # Keep Unicode word characters (letters from all scripts + digits) and spaces
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        text = re.sub(r"_", " ", text)
         return " ".join(text.split())
+
+    @staticmethod
+    def _transliterate_match_string(raw: Optional[str]) -> str:
+        """Normalize then transliterate to ASCII for cross-script comparison fallback."""
+        text = Music._normalize_match_string(raw)
+        if not text:
+            return ""
+        return unidecode(text).lower().strip()
 
     @staticmethod
     def _text_similarity(a: Optional[str], b: Optional[str]) -> float:
         left = Music._normalize_match_string(a)
         right = Music._normalize_match_string(b)
         if not left or not right:
-            return 0.0
-        return difflib.SequenceMatcher(None, left, right).ratio()
+            # Cross-script fallback: transliterate both to ASCII and retry
+            left = Music._transliterate_match_string(a)
+            right = Music._transliterate_match_string(b)
+            if not left or not right:
+                return 0.0
+        return rfuzz.ratio(left, right) / 100.0
+
+    @staticmethod
+    def _text_token_sort_similarity(a: Optional[str], b: Optional[str]) -> float:
+        """Word-order-independent fuzzy similarity (handles 'Artist Title' vs 'Title Artist')."""
+        left = Music._normalize_match_string(a)
+        right = Music._normalize_match_string(b)
+        if not left or not right:
+            left = Music._transliterate_match_string(a)
+            right = Music._transliterate_match_string(b)
+            if not left or not right:
+                return 0.0
+        return rfuzz.token_sort_ratio(left, right) / 100.0
+
+    @staticmethod
+    def _text_token_set_similarity(a: Optional[str], b: Optional[str]) -> float:
+        """Subset-aware fuzzy similarity (handles extra 'feat.' noise gracefully)."""
+        left = Music._normalize_match_string(a)
+        right = Music._normalize_match_string(b)
+        if not left or not right:
+            left = Music._transliterate_match_string(a)
+            right = Music._transliterate_match_string(b)
+            if not left or not right:
+                return 0.0
+        return rfuzz.token_set_ratio(left, right) / 100.0
 
     @staticmethod
     def _token_overlap(a: Optional[str], b: Optional[str]) -> float:
@@ -1267,14 +1553,35 @@ class Music(commands.Cog):
         actual_tokens = Music._split_artist_tokens(actual)
         if not expected_tokens or not actual_tokens:
             return 0.0
-        overlap = len(expected_tokens & actual_tokens)
-        return overlap / len(expected_tokens | actual_tokens)
+        # Exact token overlap (Jaccard)
+        exact_overlap = len(expected_tokens & actual_tokens)
+        jaccard = exact_overlap / len(expected_tokens | actual_tokens)
+        if jaccard >= 0.9:
+            return jaccard
+        # Fuzzy token matching: for each expected token, find the best-matching actual token
+        fuzzy_matches = 0
+        for exp_tok in expected_tokens:
+            best = max(
+                (JaroWinkler.similarity(exp_tok, act_tok) for act_tok in actual_tokens),
+                default=0.0,
+            )
+            if best >= 0.88:
+                fuzzy_matches += 1
+        fuzzy_score = fuzzy_matches / max(len(expected_tokens), len(actual_tokens), 1)
+        return max(jaccard, fuzzy_score)
 
     @classmethod
     def _extract_version_tags(cls, raw: Optional[str]) -> set[str]:
-        text = cls._normalize_match_string(raw)
+        """Extract version tags from the FULL title, including parenthetical content."""
+        text = str(raw or "").lower()
         if not text:
             return set()
+        # Only strip non-alphanumeric noise, but keep parenthetical content
+        # so we can detect "(Live)", "(Remix)", "(Alternative Single Version)", etc.
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        text = " ".join(text.split())
         tags: set[str] = set()
         for key, patterns in cls._TRACK_VERSION_PATTERNS.items():
             if any(re.search(pattern, text) for pattern in patterns):
@@ -1414,21 +1721,36 @@ class Music(commands.Cog):
         candidate_author = str(getattr(track, "author", "") or "")
 
         if title:
-            score += self._text_similarity(title, candidate_title) * 42
-            score += self._token_overlap(title, candidate_title) * 22
-            score += self._token_f1(title, candidate_title) * 22
-            score += self._char_ngram_cosine(title, candidate_title) * 14
+            # Sequence-level similarity (rapidfuzz)
+            score += self._text_similarity(title, candidate_title) * 32
+            # Word-order-independent similarity (handles "Artist - Title" vs "Title Artist")
+            score += self._text_token_sort_similarity(title, candidate_title) * 18
+            # Subset-aware similarity (handles extra "feat." noise)
+            score += self._text_token_set_similarity(title, candidate_title) * 12
+            # Token-level metrics
+            score += self._token_f1(title, candidate_title) * 20
+            # Character n-gram cosine (robust to small edits/typos)
+            score += self._char_ngram_cosine(title, candidate_title) * 10
+            # Exact normalized match bonus
+            if self._normalize_match_string(title) == self._normalize_match_string(candidate_title):
+                score += 12
 
         if artist:
-            score += self._text_similarity(artist, candidate_author) * 22
-            score += self._token_overlap(artist, candidate_author) * 15
-            score += self._artist_similarity(artist, candidate_author) * 28
+            # Sequence-level similarity
+            score += self._text_similarity(artist, candidate_author) * 16
+            # Jaro-Winkler-enhanced artist matching (prefix-weighted, handles typos)
+            artist_sim = self._artist_similarity(artist, candidate_author)
+            score += artist_sim * 28
+            # Token sort for reordered artist names
+            score += self._text_token_sort_similarity(artist, candidate_author) * 10
+            # Substring containment bonus
             norm_artist = self._normalize_match_string(artist)
             norm_author = self._normalize_match_string(candidate_author)
             if norm_artist and norm_author and (norm_artist in norm_author or norm_author in norm_artist):
-                score += 8
-            if self._artist_similarity(artist, candidate_author) <= 0 and self._token_overlap(artist, candidate_author) < 0.15:
-                score -= 16
+                score += 10
+            # Penalty when artist is clearly wrong
+            if artist_sim <= 0 and self._token_overlap(artist, candidate_author) < 0.15:
+                score -= 18
 
         expected_isrc = str(isrc or "").strip().upper()
         candidate_isrc = str(getattr(track, "isrc", "") or "").strip().upper()
@@ -1467,11 +1789,20 @@ class Music(commands.Cog):
         if "vevo" in candidate_author_lower:
             score += 4
 
+        # Version tag matching with mismatch penalty
         requested_tags = self._extract_version_tags(title)
         candidate_tags = self._extract_version_tags(candidate_title)
-        # Version labels should never be a hard penalty signal.
         if requested_tags:
-            score += 9 * len(requested_tags & candidate_tags)
+            matching_tags = requested_tags & candidate_tags
+            score += 10 * len(matching_tags)
+            # Penalty for version tags in candidate that weren't requested
+            unwanted_tags = candidate_tags - requested_tags
+            score -= 8 * len(unwanted_tags)
+        elif candidate_tags:
+            # No version tags requested but candidate has them → penalize
+            # This prevents "(Live)", "(Remix)", "(Alternative Version)" from beating
+            # the standard version when the user didn't ask for a variant.
+            score -= 8 * len(candidate_tags)
 
         if retrieval_score > 0:
             score += retrieval_score * self._resolver_rrf_scale
@@ -1499,13 +1830,14 @@ class Music(commands.Cog):
         duration_ms: Optional[int] = None,
         isrc: Optional[str] = None,
         matcher=None,
+        cache_scope: str = "user",
     ) -> Optional[wavelink.Playable]:
         cache_keys = self._build_resolved_link_keys(
             query=query,
             title=title,
             artist=artist,
-            duration_ms=duration_ms,
             isrc=isrc,
+            cache_scope=cache_scope,
         )
         cached_uri = self._get_cached_resolved_link(cache_keys)
         if cached_uri:
@@ -1522,9 +1854,51 @@ class Music(commands.Cog):
                 ) or cached_candidates[0]
             self._remove_cached_resolved_link(cache_keys)
 
+        # ── ISRC fast-path: if we have an ISRC, try a direct ISRC search first ──
+        if isrc and str(isrc).strip():
+            isrc_query = f"isrc:{isrc.strip().upper()}"
+            isrc_result = await self._safe_wavelink_search(isrc_query, suppress_errors=True)
+            isrc_candidates = self._extract_candidates(isrc_result)
+            if isrc_candidates:
+                # ISRC match with tight duration check → instant return
+                try:
+                    expected_dur = int(duration_ms) if duration_ms is not None else 0
+                except (TypeError, ValueError):
+                    expected_dur = 0
+                for candidate in isrc_candidates:
+                    cand_dur = int(getattr(candidate, "length", 0) or 0)
+                    if expected_dur <= 0 or cand_dur <= 0 or abs(cand_dur - expected_dur) <= 5000:
+                        cand_uri = str(getattr(candidate, "uri", "")).strip()
+                        if cand_uri:
+                            self._set_cached_resolved_link(cache_keys, cand_uri)
+                        return candidate
+
         variants = self._build_query_variants(query, title=title, artist=artist)
         if not variants:
             return None
+
+        # ── Exact title+artist fast-path ──
+        if title and artist:
+            exact_query = f"{title} {artist}"
+            exact_norm = self._normalize_match_string(exact_query)
+            for src in (wavelink.TrackSource.YouTubeMusic, wavelink.TrackSource.YouTube):
+                exact_result = await self._safe_wavelink_search(exact_query, suppress_errors=True, source=src)
+                exact_candidates = self._extract_candidates(exact_result)
+                for candidate in exact_candidates[:3]:
+                    cand_title = str(getattr(candidate, "title", "") or "")
+                    cand_author = str(getattr(candidate, "author", "") or "")
+                    cand_norm = self._normalize_match_string(f"{cand_title} {cand_author}")
+                    if exact_norm and cand_norm and exact_norm == cand_norm:
+                        try:
+                            expected_dur = int(duration_ms) if duration_ms is not None else 0
+                        except (TypeError, ValueError):
+                            expected_dur = 0
+                        cand_dur = int(getattr(candidate, "length", 0) or 0)
+                        if expected_dur <= 0 or cand_dur <= 0 or abs(cand_dur - expected_dur) <= 10000:
+                            cand_uri = str(getattr(candidate, "uri", "")).strip()
+                            if cand_uri:
+                                self._set_cached_resolved_link(cache_keys, cand_uri)
+                            return candidate
 
         sources = (
             wavelink.TrackSource.YouTubeMusic,
@@ -1550,6 +1924,13 @@ class Music(commands.Cog):
             seen_plan.add(plan_key)
             search_plan.append((None, candidate_query, variant_idx))
 
+        # ── Duration pre-filter threshold (skip grossly wrong candidates cheaply) ──
+        try:
+            dur_filter_ms = int(duration_ms) if duration_ms is not None else 0
+        except (TypeError, ValueError):
+            dur_filter_ms = 0
+        dur_filter_max_delta = 90_000  # 90 seconds
+
         merged_candidates: dict[str, wavelink.Playable] = {}
         retrieval_scores: dict[str, float] = {}
         for source, candidate_query, variant_idx in search_plan:
@@ -1562,6 +1943,11 @@ class Music(commands.Cog):
             source_weight = self._source_rrf_weight(source)
             query_weight = self._query_variant_weight(variant_idx)
             for rank, candidate in enumerate(candidates[: self._resolver_per_query_limit], start=1):
+                # Duration pre-filter: skip candidates that are wildly off in length
+                if dur_filter_ms > 0:
+                    cand_dur = int(getattr(candidate, "length", 0) or 0)
+                    if cand_dur > 0 and abs(cand_dur - dur_filter_ms) > dur_filter_max_delta:
+                        continue
                 key = self._candidate_key(candidate)
                 if key not in merged_candidates:
                     merged_candidates[key] = candidate
@@ -1670,14 +2056,21 @@ class Music(commands.Cog):
             return best_track, best_score, second_score
         return best_track
 
-    async def _resolve_spotify_tracks_parallel(self, tracks, *, matcher, concurrency: int = 4, progress_callback=None):
+    async def _resolve_spotify_tracks_parallel(
+        self,
+        tracks,
+        *,
+        matcher,
+        concurrency: int = 4,
+        progress_callback=None,
+        result_callback=None,
+    ):
         concurrency = max(1, min(concurrency, 30))
         sem = asyncio.Semaphore(concurrency)
         completed = 0
         total = len(tracks)
 
         async def resolve_one(idx: int, track_obj):
-            nonlocal completed
             try:
                 async with sem:
                     playable = await self._resolve_playable_with_fallbacks(
@@ -1687,6 +2080,7 @@ class Music(commands.Cog):
                         duration_ms=getattr(track_obj, "duration_ms", None),
                         isrc=getattr(track_obj, "isrc", None),
                         matcher=matcher,
+                        cache_scope="playlist",
                     )
                 self._annotate_playable_metadata(
                     playable,
@@ -1701,15 +2095,30 @@ class Music(commands.Cog):
             except Exception as exc:
                 logging.error("Background load failed for %s: %s", track_obj.query, exc)
                 return idx, None
-            finally:
-                completed += 1
-                if progress_callback:
-                    asyncio.create_task(progress_callback(completed, total))
+        tasks = [asyncio.create_task(resolve_one(i, rt)) for i, rt in enumerate(tracks)]
+        resolved: list[object] = []
+        for done_task in asyncio.as_completed(tasks):
+            try:
+                item = await done_task
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                raise
+            except Exception as exc:
+                item = exc
 
-        resolved = await asyncio.gather(
-            *(resolve_one(i, rt) for i, rt in enumerate(tracks)),
-            return_exceptions=True,
-        )
+            resolved.append(item)
+            completed += 1
+            if progress_callback:
+                async def _safe_progress(cb, c, t):
+                    try:
+                        await cb(c, t)
+                    except Exception:
+                        pass
+                asyncio.create_task(_safe_progress(progress_callback, completed, total))
+            if result_callback and not isinstance(item, Exception):
+                idx, playable = item
+                await result_callback(idx, playable)
 
         ordered: list[tuple[int, wavelink.Playable]] = []
         failed = 0
@@ -1788,7 +2197,7 @@ class Music(commands.Cog):
             return "Resumed the music."
 
         if not player.queue.is_empty:
-            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+            await player.play(player.queue.get(), volume=self._effective_player_volume(player))
             return "No active track was playing, so I started the next song in queue."
 
         return "There is no paused track and the queue is empty."
@@ -1823,15 +2232,28 @@ class Music(commands.Cog):
         self._manual_advance_until.pop(scope_id, None)
         self._exception_streak.pop(scope_id, None)
         self._exception_last_at.pop(scope_id, None)
+        self._queue_busy_reason.pop(scope_id, None)
+        self._queue_busy_progress.pop(scope_id, None)
+        self._dashboard_opening.discard(scope_id)
         event = self._awaiting_autoplay.pop(scope_id, None)
         if event:
             event.set()
 
     def _set_queue_busy(self, player: wavelink.Player, reason: str) -> None:
-        self._queue_busy_reason[self._player_scope_id(player)] = reason
+        scope_id = self._player_scope_id(player)
+        self._queue_busy_reason[scope_id] = reason
+        self._queue_busy_progress.pop(scope_id, None)
+
+    def _set_queue_busy_progress(self, player: wavelink.Player, *, completed: int, total: int) -> None:
+        scope_id = self._player_scope_id(player)
+        safe_total = max(0, int(total))
+        safe_completed = max(0, min(int(completed), safe_total)) if safe_total > 0 else 0
+        self._queue_busy_progress[scope_id] = (safe_completed, safe_total)
 
     def _clear_queue_busy(self, player: wavelink.Player) -> None:
-        self._queue_busy_reason.pop(self._player_scope_id(player), None)
+        scope_id = self._player_scope_id(player)
+        self._queue_busy_reason.pop(scope_id, None)
+        self._queue_busy_progress.pop(scope_id, None)
 
     def _queue_action_block_message(self, player: wavelink.Player) -> Optional[str]:
         scope_id = self._player_scope_id(player)
@@ -1839,7 +2261,21 @@ class Music(commands.Cog):
         if task and task.done():
             self._playlist_load_tasks.pop(scope_id, None)
             self._queue_busy_reason.pop(scope_id, None)
-        return self._queue_busy_reason.get(scope_id)
+            self._queue_busy_progress.pop(scope_id, None)
+        reason = self._queue_busy_reason.get(scope_id)
+        if not reason:
+            return None
+        # Only block queue actions while loading when there is no "next" track yet.
+        # If queue already has entries, user actions should proceed immediately.
+        if not bool(getattr(player.queue, "is_empty", True)):
+            return None
+        progress = self._queue_busy_progress.get(scope_id)
+        if not progress:
+            return reason
+        completed, total = progress
+        if total <= 0:
+            return reason
+        return f"{reason} ({completed}/{total})"
 
     async def _cancel_playlist_loading(self, player: wavelink.Player) -> None:
         scope_id = self._player_scope_id(player)
@@ -1848,6 +2284,7 @@ class Music(commands.Cog):
     async def _cancel_playlist_loading_by_scope_id(self, scope_id: int) -> None:
         task = self._playlist_load_tasks.pop(scope_id, None)
         self._queue_busy_reason.pop(scope_id, None)
+        self._queue_busy_progress.pop(scope_id, None)
         if not task or task.done():
             return
 
@@ -1900,7 +2337,7 @@ class Music(commands.Cog):
         await player.play(
             next_track,
             replace=True,
-            volume=int(getattr(player, "volume", 15)),
+            volume=self._effective_player_volume(player),
         )
         return True
 
@@ -2102,6 +2539,7 @@ class Music(commands.Cog):
                 finally:
                     player.ui_view = None
 
+            self._cancel_all_live_lyrics()
             await self._cancel_playlist_loading(player)
             self._cleanup_player_scope(player)
             return
@@ -2123,12 +2561,18 @@ class Music(commands.Cog):
             return
         player.autoplay = wavelink.AutoPlayMode.partial
         self._reset_exception_streak(player)
+        try:
+            await self._apply_preferred_volume(player, force=True)
+        except Exception as exc:
+            logging.debug("Failed to re-apply preferred volume on track start: %s", exc)
 
         # Signal any pending track_end fallback that Lavalink handled auto-advance,
         # so it doesn't also pop from the queue.
         event = self._awaiting_autoplay.get(self._player_scope_id(player))
         if event:
             event.set()
+        if self._player_scope_id(player) in self._dashboard_opening:
+            return
 
         # If an active dashboard already exists, refresh it in-place to avoid
         # posting a new message into the channel on every track change.
@@ -2177,15 +2621,16 @@ class Music(commands.Cog):
             if reason == "finished":
                 # Wait for on_wavelink_track_start to signal that Lavalink handled
                 # auto-advance on its own. If it does within the timeout we skip the
-                # fallback entirely, eliminating the double-pop race. If Lavalink is
-                # slow or drops the ball, the TimeoutError branch takes over.
+                # fallback entirely, eliminating the double-pop race.
+                # YouTube stream resolution takes 1-3 seconds, so give Lavalink
+                # 4.5 seconds to naturally advance before we force it.
                 event = asyncio.Event()
                 self._awaiting_autoplay[scope_id] = event
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=0.5)
+                    await asyncio.wait_for(event.wait(), timeout=4.5)
                     # Lavalink fired track_start — it handled the advance.
                 except asyncio.TimeoutError:
-                    # Lavalink didn't auto-advance; kick the queue if still idle.
+                    # Lavalink didn't auto-advance or took too long; kick the queue if still idle.
                     if not player.playing and not player.current and not player.queue.is_empty:
                         try:
                             await self._force_start_next_from_queue(player)
@@ -2211,8 +2656,12 @@ class Music(commands.Cog):
         streak = self._register_exception_and_get_streak(player)
 
         exc = payload.exception
-        message = exc.get("message", "Unknown playback error")
-        cause = exc.get("cause", "Unknown cause")
+        if isinstance(exc, dict):
+            message = exc.get("message", "Unknown playback error")
+            cause = exc.get("cause", "Unknown cause")
+        else:
+            message = str(exc) if exc else "Unknown playback error"
+            cause = str(getattr(exc, "__cause__", "") or "Unknown cause")
         logging.error(
             "Track exception for '%s' (streak=%s): %s | %s",
             payload.track.title,
@@ -2255,7 +2704,7 @@ class Music(commands.Cog):
                 await player.play(
                     next_track,
                     replace=True,
-                    volume=int(getattr(player, "volume", 15)),
+                    volume=self._effective_player_volume(player),
                 )
             except Exception as exc:
                 logging.error("Failed to continue playback after track exception: %s", exc)
@@ -2328,6 +2777,7 @@ class Music(commands.Cog):
             finally:
                 player.ui_view = None
 
+        self._cancel_all_live_lyrics()
         await self._cancel_playlist_loading(player)
         self._cleanup_player_scope(player)
 
@@ -2372,9 +2822,9 @@ class Music(commands.Cog):
 
         if created_player:
             try:
-                await player.set_volume(15)
+                await self._apply_preferred_volume(player, force=True)
             except Exception as exc:
-                logging.debug("Failed to set default volume on new playback player: %s", exc)
+                logging.debug("Failed to set preferred volume on new playback player: %s", exc)
 
         player.home = interaction.channel
         # Ensure queue tracks continue automatically without needing manual /resume.
@@ -2498,7 +2948,7 @@ class Music(commands.Cog):
                         )
 
                         if not player.playing and not player.queue.is_empty:
-                            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+                            await player.play(player.queue.get(), volume=self._effective_player_volume(player))
 
                         if getattr(player, "ui_view", None):
                             await player.ui_view.update_player_message()
@@ -2518,7 +2968,7 @@ class Music(commands.Cog):
                         )
 
                         if not player.playing and not player.queue.is_empty:
-                            await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+                            await player.play(player.queue.get(), volume=self._effective_player_volume(player))
                         self._clear_queue_busy(player)
                         return
 
@@ -2531,7 +2981,11 @@ class Music(commands.Cog):
                 # "Recently Added" for Spotify playlists must use actual added timestamps.
                 if use_recent_order:
                     tracks = self._order_playlist_tracks_by_recent_add(tracks)
-                
+
+                if not tracks:
+                    self._clear_queue_busy(player)
+                    return await interaction.followup.send("❌ Playlist was empty after ordering.")
+
                 # Load first track immediately
                 first_track = tracks.pop(0)
                 # Query YouTube Music for higher official audio quality and score top candidates.
@@ -2542,6 +2996,7 @@ class Music(commands.Cog):
                     duration_ms=getattr(first_track, "duration_ms", None),
                     isrc=getattr(first_track, "isrc", None),
                     matcher=matcher,
+                    cache_scope="playlist",
                 )
                 if not first_playable:
                     self._clear_queue_busy(player)
@@ -2561,6 +3016,7 @@ class Music(commands.Cog):
                     await player.queue.put_wait(first_playable)
 
                 remaining_count = len(tracks)
+                self._set_queue_busy_progress(player, completed=0, total=remaining_count)
                 if remaining_count > 0:
                     success_status = (
                         f"✅ Fast-loaded **{first_playable.title}** ({order_label}). "
@@ -2579,7 +3035,7 @@ class Music(commands.Cog):
                     await interaction.followup.send(success_status, ephemeral=True)
                 
                 if not player.playing:
-                    await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+                    await player.play(player.queue.get(), volume=self._effective_player_volume(player))
 
                 if not tracks:
                     self._clear_queue_busy(player)
@@ -2600,6 +3056,7 @@ class Music(commands.Cog):
                     last_update = time.time()
                     async def on_progress(completed: int, total: int):
                         nonlocal last_update
+                        self._set_queue_busy_progress(current_player, completed=completed, total=total)
                         now = time.time()
                         if completed == total or now - last_update > 2.0:
                             last_update = now
@@ -2613,28 +3070,40 @@ class Music(commands.Cog):
                                 except Exception:
                                     pass
 
+                    pending_by_index: dict[int, Optional[wavelink.Playable]] = {}
+                    next_expected_index = 0
+                    added_count = 0
+
+                    async def on_result(resolved_index: int, playable: Optional[wavelink.Playable]) -> None:
+                        nonlocal next_expected_index, added_count
+                        pending_by_index[resolved_index] = playable
+
+                        while next_expected_index in pending_by_index:
+                            next_playable = pending_by_index.pop(next_expected_index)
+                            if next_playable:
+                                if start_idx is not None:
+                                    insert_base = max(0, start_idx + 1)
+                                    safe_idx = max(0, min(insert_base + added_count, current_player.queue.count))
+                                    current_player.queue.put_at(safe_idx, next_playable)
+                                else:
+                                    await current_player.queue.put_wait(next_playable)
+                                added_count += 1
+                            next_expected_index += 1
+
                     try:
-                        playables, failed_count = await self._resolve_spotify_tracks_parallel(
+                        _, failed_count = await self._resolve_spotify_tracks_parallel(
                             track_list,
                             matcher=matcher,
                             concurrency=concurrency,
                             progress_callback=on_progress,
+                            result_callback=on_result,
                         )
-
-                        if start_idx is not None:
-                            insert_base = max(0, start_idx + 1)
-                            for offset, playable in enumerate(playables):
-                                safe_idx = max(0, min(insert_base + offset, current_player.queue.count))
-                                current_player.queue.put_at(safe_idx, playable)
-                        else:
-                            for playable in playables:
-                                await current_player.queue.put_wait(playable)
 
                         if failed_count and getattr(current_player, "home", None):
                             try:
                                 await current_player.home.send(
                                     f"⚠️ Queue enrichment completed with partial failures: "
-                                    f"added {len(playables)}/{len(track_list)} tracks "
+                                    f"added {added_count}/{len(track_list)} tracks "
                                     f"(failed: {failed_count})."
                                 )
                             except Exception:
@@ -2675,6 +3144,7 @@ class Music(commands.Cog):
                     duration_ms=getattr(track_info, "duration_ms", None),
                     isrc=getattr(track_info, "isrc", None),
                     matcher=matcher,
+                    cache_scope="user",
                 )
                 if not playable:
                     return await interaction.followup.send("❌ Could not find audio for this Spotify track.")
@@ -2705,7 +3175,7 @@ class Music(commands.Cog):
                 await interaction.followup.send(msg)
 
                 if not player.playing:
-                    await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+                    await player.play(player.queue.get(), volume=self._effective_player_volume(player))
                 
                 if getattr(player, "ui_view", None):
                     await player.ui_view.update_player_message()
@@ -2763,6 +3233,7 @@ class Music(commands.Cog):
                     query=query,
                     title=query,
                     artist=None,
+                    cache_scope="user",
                 )
                 if not track:
                     await interaction.followup.send(f"Could not find any songs for `{query}`.")
@@ -2786,7 +3257,7 @@ class Music(commands.Cog):
                 await interaction.followup.send(msg)
 
             if not player.playing:
-                await player.play(player.queue.get(), volume=int(getattr(player, "volume", 15)))
+                await player.play(player.queue.get(), volume=self._effective_player_volume(player))
                 
             if getattr(player, "ui_view", None):
                 await player.ui_view.update_player_message()
