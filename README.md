@@ -59,6 +59,12 @@ Optional ML reranker:
 - Set `TRACK_RESOLVER_ML_RERANK_ENABLED=1`
 - Optionally override `TRACK_RESOLVER_ML_RERANK_MODEL`
 
+AI DJ semantic embeddings (optional):
+
+- Install extra deps: `pip install sentence-transformers torch`
+- Keep `DJ_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2` for model-based vectors
+- Set `DJ_EMBED_MODEL=hash` to force lightweight hashed vectors
+
 Lyrics (optional):
 
 - `LYRICS_CACHE_ENABLED`
@@ -72,6 +78,15 @@ Lyrics (optional):
 - `LYRICS_SPOTIFY_WEB_TOKEN` / `LYRICS_SPOTIFY_WEB_TOKEN_AUTO`
 - Note: Spotify lyrics endpoint is unofficial and may change/break without notice.
 - Optional Genius fallback: set `GENIUS_ACCESS_TOKEN`
+
+Dashboard reliability tuning (optional):
+
+- `UI_REFRESH_INTERVAL_SECONDS`
+- `UI_DASHBOARD_VOICE_GAP_STOP_SECONDS`
+- `UI_DASHBOARD_STALE_SECONDS`
+- `UI_DASHBOARD_STALE_COOLDOWN_SECONDS`
+- `UI_DASHBOARD_REFRESH_FAIL_REBIND_THRESHOLD`
+- `UI_DASHBOARD_EDIT_TIMEOUT_SECONDS`
 
 ## 3) Spotify OAuth user token (recommended)
 
@@ -129,7 +144,7 @@ On successful startup you should see:
 - `cogs/ui.py` - dashboard UI components
 - `utils/` - matching/resolver utilities
 - `data/` - playlist/cache data
-- `logs/` - Lavalink logs (`spring.log`)
+- `logs/` - Lavalink logs (`spring.log`) and bot runtime logs (`bot.log`)
 
 ## Troubleshooting
 
@@ -140,6 +155,13 @@ On successful startup you should see:
   - Verify Spotify app credentials.
   - Ensure redirect URI in Spotify dashboard exactly matches `.env`.
   - Run `python scripts/setup_spotify_oauth.py` and restart bot.
+- AI DJ logs `sentence-transformers` unavailable:
+  - This is non-fatal; AI DJ uses hashed fallback embeddings.
+  - Install `sentence-transformers` + `torch` to enable model-based embeddings.
+  - Or set `DJ_EMBED_MODEL=hash` to silence model loading attempts.
+- Dashboard appears stuck on one song:
+  - Check `logs/bot.log` for `dashboard_*` events (`dashboard_loop_restart`, `dashboard_rebind_failure`, `dashboard_render_timeout`).
+  - If these repeat frequently, raise `UI_REFRESH_INTERVAL_SECONDS` (for example `0.8` or `1.0`).
 - Slash commands not visible immediately:
   - Wait briefly after startup sync and reopen Discord.
 
