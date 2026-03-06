@@ -22,8 +22,8 @@ A Discord music bot with an interactive `/music` dashboard, queue controls, Spot
 ## 1) Install dependencies
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -55,13 +55,13 @@ Resolver quality (optional):
 
 Optional ML reranker:
 
-- Install extra deps: `pip install sentence-transformers torch`
+- `sentence-transformers` and `torch` are already included in `requirements.txt`
 - Set `TRACK_RESOLVER_ML_RERANK_ENABLED=1`
 - Optionally override `TRACK_RESOLVER_ML_RERANK_MODEL`
 
 AI DJ semantic embeddings (optional):
 
-- Install extra deps: `pip install sentence-transformers torch`
+- `sentence-transformers` and `torch` are already included in `requirements.txt`
 - Keep `DJ_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2` for model-based vectors
 - Set `DJ_EMBED_MODEL=hash` to force lightweight hashed vectors
 
