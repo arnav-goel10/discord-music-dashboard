@@ -115,6 +115,10 @@ class Music(commands.Cog):
         self._queue_busy_progress: dict[int, tuple[int, int]] = {}
         self._dashboard_opening: set[int] = set()
         self._awaiting_autoplay: dict[int, asyncio.Event] = {}
+        # AI DJ: per-player track-start timestamps for listen duration calculation
+        self._dj_track_start_at: dict[int, float] = {}
+        self._dj_track_info: dict[int, dict] = {}  # {title, artist, duration_ms, source}
+        self._dj_auto_queue_tasks: dict[int, asyncio.Task] = {}
         self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
         self._resolved_links_cache_enabled = (
             os.getenv("RESOLVED_TRACK_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -160,9 +164,12 @@ class Music(commands.Cog):
         self._live_lyrics_tasks: dict[int, asyncio.Task] = {}
         self._lyrics_auto_delete_tasks: dict[int, asyncio.Task] = {}
         self._default_player_volume = self._env_int("DEFAULT_PLAYER_VOLUME", 15, minimum=0, maximum=100)
+        self._dj_cleanup_task: Optional[asyncio.Task] = asyncio.create_task(self._periodic_dj_cleanup())
 
     def cog_unload(self):
         self._cancel_all_live_lyrics()
+        if self._dj_cleanup_task and not self._dj_cleanup_task.done():
+            self._dj_cleanup_task.cancel()
 
     def _cancel_all_live_lyrics(self) -> None:
         for task in list(self._live_lyrics_tasks.values()):
@@ -173,6 +180,19 @@ class Music(commands.Cog):
             if task and not task.done():
                 task.cancel()
         self._lyrics_auto_delete_tasks.clear()
+
+    async def _periodic_dj_cleanup(self) -> None:
+        """Periodically clean up idle DJ sessions and stale guild stats."""
+        try:
+            while True:
+                await asyncio.sleep(600)  # every 10 minutes
+                try:
+                    from utils.dj import dj as ai_dj
+                    ai_dj.cleanup_idle_sessions()
+                except Exception as exc:
+                    logging.debug("DJ cleanup error: %s", exc)
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     def _clamp_volume(value: int) -> int:
@@ -455,6 +475,15 @@ class Music(commands.Cog):
                 rows.append((key, uri, now))
         if rows:
             self._upsert_resolved_links_entries(rows)
+        # Evict oldest entries if cache exceeds max size
+        _MAX_RESOLVED_CACHE = 10_000
+        if len(self._resolved_links_cache) > _MAX_RESOLVED_CACHE:
+            sorted_keys = sorted(
+                self._resolved_links_cache,
+                key=lambda k: (self._resolved_links_cache[k] or {}).get("updated_at", 0),
+            )
+            for k in sorted_keys[: len(sorted_keys) - _MAX_RESOLVED_CACHE]:
+                self._resolved_links_cache.pop(k, None)
 
     def _remove_cached_resolved_link(self, keys: list[str]) -> None:
         if not self._resolved_links_cache_enabled or not keys:
@@ -1246,7 +1275,7 @@ class Music(commands.Cog):
                     delete_when_done=True,
                 )
             )
-            self._live_lyrics_tasks[id(sent)] = task
+            self._live_lyrics_tasks[int(getattr(sent, "id", 0) or 0)] = task
             return
 
         embeds = self._build_lyrics_embeds(
@@ -2204,11 +2233,7 @@ class Music(commands.Cog):
 
     def _get_player_action_lock(self, player: wavelink.Player) -> asyncio.Lock:
         guild_id = self._player_scope_id(player)
-        lock = self._player_action_locks.get(guild_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._player_action_locks[guild_id] = lock
-        return lock
+        return self._player_action_locks.setdefault(guild_id, asyncio.Lock())
 
     @staticmethod
     def _player_scope_id(player: wavelink.Player) -> int:
@@ -2238,6 +2263,14 @@ class Music(commands.Cog):
         event = self._awaiting_autoplay.pop(scope_id, None)
         if event:
             event.set()
+        # AI DJ cleanup
+        self._dj_track_start_at.pop(scope_id, None)
+        self._dj_track_info.pop(scope_id, None)
+        dj_task = self._dj_auto_queue_tasks.pop(scope_id, None)
+        if dj_task and not dj_task.done():
+            dj_task.cancel()
+        from utils.dj import dj as ai_dj
+        ai_dj.stop_session(scope_id)
 
     def _set_queue_busy(self, player: wavelink.Player, reason: str) -> None:
         scope_id = self._player_scope_id(player)
@@ -2346,6 +2379,12 @@ class Music(commands.Cog):
         if blocked_reason:
             return f"⏳ {blocked_reason}. Please wait a moment."
 
+        # ── AI DJ: record explicit skip signal ──
+        scope_id = self._player_scope_id(player)
+        if player.current:
+            position_ms = int(getattr(player, "position", 0) or 0)
+            await self._dj_record_skip(scope_id, player, position_ms)
+
         lock = self._get_player_action_lock(player)
         async with lock:
             async def _ensure_not_paused() -> None:
@@ -2400,6 +2439,12 @@ class Music(commands.Cog):
                     await player.stop(force=True)
                 except Exception:
                     pass
+
+            # ── AI DJ: auto-queue after skip empties the queue ──
+            from utils.dj import dj as ai_dj
+            if ai_dj.is_active(scope_id):
+                await self._dj_auto_queue_next(player)
+                return "AI DJ is finding the next track..."
 
             return "Queue is empty."
 
@@ -2498,6 +2543,13 @@ class Music(commands.Cog):
         except Exception as exc:
             logging.debug("Failed to re-dispatch guild voice state after websocket close: %s", exc)
 
+        ui_view = getattr(player, "ui_view", None)
+        if ui_view and hasattr(ui_view, "ensure_refresh_task_running"):
+            try:
+                ui_view.ensure_refresh_task_running("websocket_closed")
+            except Exception as exc:
+                logging.debug("Failed to ensure dashboard refresh loop after websocket close: %s", exc)
+
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
         print(f"Wavelink Node connected: {payload.node!r} | Resumed: {payload.resumed}")
@@ -2566,6 +2618,36 @@ class Music(commands.Cog):
         except Exception as exc:
             logging.debug("Failed to re-apply preferred volume on track start: %s", exc)
 
+        # ── AI DJ: record track start for listen-duration calculation ──
+        scope_id = self._player_scope_id(player)
+        track = payload.track
+        if track:
+            self._dj_track_start_at[scope_id] = time.time()
+            source = "ai_dj" if getattr(track, "_dj_recommended", False) else "user_queued"
+            self._dj_track_info[scope_id] = {
+                "title": getattr(track, "_source_title", None) or track.title,
+                "artist": getattr(track, "_source_artist", None) or getattr(track, "author", "Unknown"),
+                "duration_ms": int(getattr(track, "length", 0) or 0),
+                "source": source,
+                "model_version": str(getattr(track, "_dj_model_version", "") or ""),
+                "exploration": bool(getattr(track, "_dj_exploration", False)),
+                "rank_features": dict(getattr(track, "_dj_rank_features", {}) or {}),
+                "candidate_sources": list(getattr(track, "_dj_candidate_sources", []) or []),
+            }
+            # Add as seed for the DJ session
+            from utils.dj import dj as ai_dj, SeedTrack
+            if ai_dj.is_active(scope_id):
+                ai_dj.add_seed(
+                    scope_id,
+                    SeedTrack(
+                        title=self._dj_track_info[scope_id]["title"],
+                        artist=self._dj_track_info[scope_id]["artist"],
+                        duration_ms=self._dj_track_info[scope_id]["duration_ms"],
+                    ),
+                )
+                # Pre-fetch next recommendations while current track plays
+                ai_dj.trigger_prefetch(scope_id)
+
         # Signal any pending track_end fallback that Lavalink handled auto-advance,
         # so it doesn't also pop from the queue.
         event = self._awaiting_autoplay.get(self._player_scope_id(player))
@@ -2580,6 +2662,8 @@ class Music(commands.Cog):
         existing_message = getattr(player, "ui_message", None)
         if existing_view and existing_message:
             try:
+                if hasattr(existing_view, "ensure_refresh_task_running"):
+                    existing_view.ensure_refresh_task_running("track_start")
                 await existing_view.update_player_message(force=True)
                 return
             except Exception as exc:
@@ -2611,11 +2695,15 @@ class Music(commands.Cog):
             return
 
         scope_id = self._player_scope_id(player)
+        reason = str(getattr(payload, "reason", "") or "").lower()
+
+        # ── AI DJ: record listen event ──
+        await self._dj_record_track_end(scope_id, player, reason)
+
         if self._manual_advance_until.get(scope_id, 0.0) > time.time():
             # A manual skip/replace path already advanced playback. Avoid double-pop.
             pass
         else:
-            reason = str(getattr(payload, "reason", "") or "").lower()
             # Only fallback-advance when a track naturally finishes.
             # Load failures are handled by on_wavelink_track_exception.
             if reason == "finished":
@@ -2636,6 +2724,9 @@ class Music(commands.Cog):
                             await self._force_start_next_from_queue(player)
                         except Exception as exc:
                             logging.debug("Failed to force-start next track on track_end: %s", exc)
+                    # ── AI DJ: queue next recommendation if queue is empty ──
+                    elif not player.playing and not player.current and player.queue.is_empty:
+                        await self._dj_auto_queue_next(player)
                 except asyncio.CancelledError:
                     raise
                 finally:
@@ -2643,6 +2734,8 @@ class Music(commands.Cog):
 
         if getattr(player, "ui_view", None):
             try:
+                if hasattr(player.ui_view, "ensure_refresh_task_running"):
+                    player.ui_view.ensure_refresh_task_running("track_end")
                 await player.ui_view.update_player_message()
             except Exception as exc:
                 logging.debug("Failed to refresh player UI on track end: %s", exc)
@@ -2788,6 +2881,240 @@ class Music(commands.Cog):
             return
 
         await self._reply(interaction, "Stopped playback and disconnected from voice.", ephemeral=True)
+
+    # ── AI DJ helper methods ────────────────────────────────────────────
+
+    async def _dj_record_track_end(self, scope_id: int, player: wavelink.Player, reason: str) -> None:
+        """Record a listen event when a track ends (naturally or via replacement)."""
+        info = self._dj_track_info.pop(scope_id, None)
+        start_at = self._dj_track_start_at.pop(scope_id, None)
+        if not info or not start_at:
+            return
+
+        listened_ms = int((time.time() - start_at) * 1000)
+        duration_ms = info.get("duration_ms", 0)
+
+        # Determine if this was a skip based on listen percentage
+        was_skipped = False
+        if reason in ("replaced", "stopped"):
+            # Track was replaced by skip or another track
+            skip_threshold_ms = max(
+                int(os.getenv("DJ_SKIP_THRESHOLD_SECONDS", "30")) * 1000,
+                5000,
+            )
+            if duration_ms > 0:
+                listen_pct = (listened_ms / duration_ms) * 100
+                min_pct = int(os.getenv("DJ_MIN_LISTEN_FOR_COMPLETION_PCT", "75"))
+                was_skipped = listened_ms < skip_threshold_ms or listen_pct < min_pct
+            else:
+                was_skipped = listened_ms < skip_threshold_ms
+
+        # Get a user ID from voice channel members (best effort)
+        user_id = 0
+        guild = getattr(player, "guild", None)
+        if guild and guild.voice_client:
+            channel = getattr(guild.voice_client, "channel", None)
+            if channel:
+                members = [m for m in channel.members if not m.bot]
+                if members:
+                    user_id = members[0].id
+
+        from utils.dj import dj as ai_dj
+        try:
+            await ai_dj.record_listen(
+                guild_id=scope_id,
+                user_id=user_id,
+                title=info["title"],
+                artist=info["artist"],
+                duration_ms=duration_ms,
+                listened_ms=listened_ms,
+                was_skipped=was_skipped,
+                source=info.get("source", "user_queued"),
+                context={
+                    "event_reason": reason,
+                    "queue_size": len(player.queue),
+                    "model_version": info.get("model_version", ""),
+                    "exploration": bool(info.get("exploration", False)),
+                    "rank_features": dict(info.get("rank_features", {}) or {}),
+                    "candidate_sources": list(info.get("candidate_sources", []) or []),
+                },
+            )
+        except Exception as exc:
+            logging.debug("Failed to record DJ listen event: %s", exc)
+
+    async def _dj_record_skip(self, scope_id: int, player: wavelink.Player, position_ms: int) -> None:
+        """Record an explicit skip signal (user pressed skip button)."""
+        info = self._dj_track_info.get(scope_id)
+        if not info:
+            return
+
+        duration_ms = info.get("duration_ms", 0)
+
+        user_id = 0
+        guild = getattr(player, "guild", None)
+        if guild and guild.voice_client:
+            channel = getattr(guild.voice_client, "channel", None)
+            if channel:
+                members = [m for m in channel.members if not m.bot]
+                if members:
+                    user_id = members[0].id
+
+        from utils.dj import dj as ai_dj
+        try:
+            await ai_dj.record_listen(
+                guild_id=scope_id,
+                user_id=user_id,
+                title=info["title"],
+                artist=info["artist"],
+                duration_ms=duration_ms,
+                listened_ms=position_ms,
+                was_skipped=True,
+                skip_position_ms=position_ms,
+                source=info.get("source", "user_queued"),
+                context={
+                    "event_reason": "explicit_skip",
+                    "queue_size": len(player.queue),
+                    "model_version": info.get("model_version", ""),
+                    "exploration": bool(info.get("exploration", False)),
+                    "rank_features": dict(info.get("rank_features", {}) or {}),
+                    "candidate_sources": list(info.get("candidate_sources", []) or []),
+                },
+            )
+        except Exception as exc:
+            logging.debug("Failed to record DJ skip event: %s", exc)
+
+        # Immediately react: flush stale buffer, pivot recommendations
+        ai_dj.on_skip(
+            scope_id,
+            info["title"],
+            info["artist"],
+            listened_ms=position_ms,
+            duration_ms=duration_ms,
+        )
+
+        # Clear the track info so track_end doesn't double-record
+        self._dj_track_info.pop(scope_id, None)
+        self._dj_track_start_at.pop(scope_id, None)
+
+    async def _dj_auto_queue_next(self, player: wavelink.Player) -> None:
+        """When queue is empty and AI DJ is active, resolve and play the next recommendation."""
+        scope_id = self._player_scope_id(player)
+        from utils.dj import dj as ai_dj
+        if not ai_dj.is_active(scope_id):
+            return
+
+        # Avoid duplicate auto-queue tasks (atomic setdefault-like guard)
+        existing = self._dj_auto_queue_tasks.get(scope_id)
+        if existing and not existing.done():
+            return
+
+        # Sentinel: mark slot immediately to prevent concurrent spawns
+        sentinel = asyncio.get_event_loop().create_future()
+        sentinel.set_result(None)
+        self._dj_auto_queue_tasks[scope_id] = sentinel
+
+        async def _do_auto_queue(_depth: int = 0):
+            if _depth >= 5:
+                logging.debug("AI DJ: exhausted retry depth for guild %s", scope_id)
+                return
+            try:
+                rec = await ai_dj.pop_next_recommendation(scope_id)
+                if not rec:
+                    logging.debug("AI DJ: no recommendations available for guild %s", scope_id)
+                    return
+
+                logging.info("AI DJ recommending: %s - %s (reason: %s)", rec.artist, rec.title, rec.reason)
+                guild = getattr(player, "guild", None)
+                resolver_user_id = 0
+                if guild and guild.voice_client:
+                    channel = getattr(guild.voice_client, "channel", None)
+                    if channel:
+                        members = [m for m in channel.members if not m.bot]
+                        if members:
+                            resolver_user_id = int(getattr(members[0], "id", 0) or 0)
+
+                # Resolve the recommendation to a playable track
+                from utils.matcher import matcher
+                playable = await self._resolve_playable_with_fallbacks(
+                    query=f"{rec.title} {rec.artist}",
+                    title=rec.title,
+                    artist=rec.artist,
+                    matcher=matcher,
+                    cache_scope="user",
+                )
+                if not playable:
+                    # Try a simpler search
+                    search_result = await self._safe_wavelink_search(f"ytmsearch:{rec.title} {rec.artist}")
+                    candidates = self._extract_candidates(search_result)
+                    if candidates:
+                        playable = candidates[0]
+
+                if not playable:
+                    try:
+                        await ai_dj.record_resolver_outcome(
+                            guild_id=scope_id,
+                            user_id=resolver_user_id,
+                            title=rec.title,
+                            artist=rec.artist,
+                            resolved=False,
+                            context={
+                                "model_version": rec.model_version,
+                                "source": rec.source,
+                                "reason": rec.reason,
+                                "candidate_sources": list(rec.candidate_sources or []),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    logging.debug("AI DJ: failed to resolve '%s - %s', trying next", rec.artist, rec.title)
+                    return await _do_auto_queue(_depth + 1)
+
+                # Mark the track as DJ-recommended for signal tracking
+                playable._dj_recommended = True
+                playable._source_title = rec.title
+                playable._source_artist = rec.artist
+                playable._dj_reason = rec.reason
+                playable._dj_model_version = rec.model_version
+                playable._dj_exploration = rec.exploration_flag
+                playable._dj_rank_features = dict(rec.rank_features or {})
+                playable._dj_candidate_sources = list(rec.candidate_sources or [])
+                try:
+                    await ai_dj.record_resolver_outcome(
+                        guild_id=scope_id,
+                        user_id=resolver_user_id,
+                        title=rec.title,
+                        artist=rec.artist,
+                        resolved=True,
+                        context={
+                            "model_version": rec.model_version,
+                            "source": rec.source,
+                            "reason": rec.reason,
+                            "candidate_sources": list(rec.candidate_sources or []),
+                        },
+                    )
+                except Exception:
+                    pass
+
+                # Queue and play
+                if not player.playing and not player.current:
+                    self._manual_advance_until[scope_id] = time.time() + 2.0
+                    await player.play(
+                        playable,
+                        volume=self._effective_player_volume(player),
+                    )
+                else:
+                    await player.queue.put_wait(playable)
+
+                # Pre-fetch the next batch so buffer is ready for the next transition/skip
+                ai_dj.trigger_prefetch(scope_id)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.warning("AI DJ auto-queue error: %s", exc)
+
+        task = asyncio.create_task(_do_auto_queue())
+        self._dj_auto_queue_tasks[scope_id] = task
 
     async def _execute_play(
         self,

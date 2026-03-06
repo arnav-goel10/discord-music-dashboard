@@ -20,6 +20,35 @@ _HAS_LAYOUT_V2 = all(
 )
 _DashboardBaseView = discord.ui.LayoutView if _HAS_LAYOUT_V2 else discord.ui.View
 
+
+def _env_float(name: str, default: float, *, minimum: Optional[float] = None) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        value = float(default)
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    return value
+
+
+def _env_int(name: str, default: int, *, minimum: Optional[int] = None) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        value = int(default)
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    return value
+
+
 def _fmt_ms(ms: int) -> str:
     total_seconds = max(0, ms // 1000)
     minutes, seconds = divmod(total_seconds, 60)
@@ -1056,10 +1085,19 @@ class SpotifyUI(_DashboardBaseView):
         super().__init__(timeout=None)
         self.player = player
         self.message: Optional[discord.Message] = None
+        self._stopped = False
         self._render_lock = asyncio.Lock()
         self._rebind_lock = asyncio.Lock()
         self._last_rebind_attempt_at: float = 0.0
         self._has_ever_bound_message: bool = False
+        self._voice_gap_started_at: Optional[float] = None
+        self._consecutive_voice_gap_ticks: int = 0
+        self._consecutive_refresh_failures: int = 0
+        self._last_refresh_failure_at: float = 0.0
+        self._last_successful_render_at: float = time.monotonic()
+        self._last_rendered_track_key: str = self._track_key(player.current)
+        self._last_stale_recovery_at: float = 0.0
+        self._refresh_restart_count: int = 0
         self._use_v2_layout = _HAS_LAYOUT_V2
         self._v2_header_container = None
         self._v2_section = None
@@ -1068,20 +1106,49 @@ class SpotifyUI(_DashboardBaseView):
         self._v2_progress_text = None
         self._v2_fallback_accessory = None
         self._v2_thumb_url: str = ""
-        self._position_anchor_ms: int = int(getattr(player, "position", 0) or 0)
-        self._position_anchor_at: float = time.monotonic()
-        self._position_anchor_track_key: str = self._track_key(player.current)
-        refresh_raw = (os.getenv("UI_REFRESH_INTERVAL_SECONDS") or "0.70").strip()
-        try:
-            self._refresh_interval = max(0.55, float(refresh_raw))
-        except ValueError:
-            self._refresh_interval = 0.70
+        # (track_key, position_ms, monotonic_time) — assigned atomically to avoid torn reads
+        self._position_anchor: tuple[str, int, float] = (
+            self._track_key(player.current),
+            int(getattr(player, "position", 0) or 0),
+            time.monotonic(),
+        )
+        self._refresh_interval = _env_float("UI_REFRESH_INTERVAL_SECONDS", 0.70, minimum=0.55)
+        self._voice_gap_stop_seconds = _env_float("UI_DASHBOARD_VOICE_GAP_STOP_SECONDS", 30.0, minimum=5.0)
+        self._stale_seconds = _env_float("UI_DASHBOARD_STALE_SECONDS", 12.0, minimum=3.0)
+        self._stale_cooldown_seconds = _env_float("UI_DASHBOARD_STALE_COOLDOWN_SECONDS", 15.0, minimum=3.0)
+        self._refresh_fail_rebind_threshold = _env_int(
+            "UI_DASHBOARD_REFRESH_FAIL_REBIND_THRESHOLD", 3, minimum=1
+        )
+        self._edit_timeout_seconds = _env_float("UI_DASHBOARD_EDIT_TIMEOUT_SECONDS", 8.0, minimum=1.0)
         self._setup_controls_for_layout_if_needed()
         self._setup_v2_layout_shell()
         self._reorder_fallback_controls_if_needed()
-        self._refresh_task: Optional[asyncio.Task] = asyncio.create_task(self._auto_refresh_loop())
+        self._refresh_task: Optional[asyncio.Task] = None
         self._last_render_key: Optional[tuple] = None
         self._sync_components()
+        self.ensure_refresh_task_running("init")
+
+    def _dashboard_scope_label(self) -> str:
+        guild = getattr(self.player, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        msg_id = getattr(self.message, "id", None)
+        return f"guild={guild_id} msg={msg_id}"
+
+    def ensure_refresh_task_running(self, reason: str) -> bool:
+        if self._stopped:
+            return False
+        if self._refresh_task and not self._refresh_task.done():
+            return False
+        if self._refresh_task and self._refresh_task.done():
+            self._refresh_restart_count += 1
+            logging.info(
+                "dashboard_loop_restart reason=%s restart_count=%s %s",
+                reason,
+                self._refresh_restart_count,
+                self._dashboard_scope_label(),
+            )
+        self._refresh_task = asyncio.create_task(self._auto_refresh_loop())
+        return True
 
     @property
     def uses_v2_layout(self) -> bool:
@@ -1182,6 +1249,9 @@ class SpotifyUI(_DashboardBaseView):
         self.filter_popup = discord.ui.Button(
             style=discord.ButtonStyle.secondary, emoji=None, label="Fx", row=1
         )
+        self.toggle_dj = discord.ui.Button(
+            style=discord.ButtonStyle.secondary, emoji=None, label="DJ", row=2
+        )
 
         self.previous_track.callback = self._manual_previous_track
         self.pause_resume.callback = self._manual_pause_resume
@@ -1194,6 +1264,7 @@ class SpotifyUI(_DashboardBaseView):
         self.manage_lists.callback = self._manual_manage_lists
         self.volume_set.callback = self._manual_volume_set
         self.filter_popup.callback = self._manual_filter_popup
+        self.toggle_dj.callback = self._manual_toggle_dj
 
         action_row_cls = getattr(discord.ui, "ActionRow", None)
         if not action_row_cls:
@@ -1216,6 +1287,7 @@ class SpotifyUI(_DashboardBaseView):
         )
         self._v2_controls_row_library = action_row_cls(
             self.manage_lists,
+            self.toggle_dj,
         )
 
         self.add_item(self._v2_controls_row_primary)
@@ -1239,6 +1311,7 @@ class SpotifyUI(_DashboardBaseView):
             self.show_queue,
             self.add_track,
             self.manage_lists,
+            self.toggle_dj,
         ]
 
         self.clear_items()
@@ -1277,6 +1350,9 @@ class SpotifyUI(_DashboardBaseView):
 
     async def _manual_filter_popup(self, interaction: discord.Interaction) -> None:
         await SpotifyUI.filter_popup(self, interaction, self.filter_popup)
+
+    async def _manual_toggle_dj(self, interaction: discord.Interaction) -> None:
+        await SpotifyUI.toggle_ai_dj(self, interaction, self.toggle_dj)
 
     def _sync_v2_dashboard_card(self) -> None:
         if not self._use_v2_layout or not all(
@@ -1320,7 +1396,22 @@ class SpotifyUI(_DashboardBaseView):
             self._v2_title_text.content = f"### [{safe_label}]({track_url})"
         else:
             self._v2_title_text.content = f"### {song_artist_label}"
-        self._v2_meta_text.content = "\u200b"
+        # AI DJ indicator for v2 layout
+        dj_meta = "\u200b"
+        from utils.dj import dj as ai_dj
+        guild = getattr(self.player, "guild", None)
+        guild_id_v2 = getattr(guild, "id", 0) if guild else 0
+        if guild_id_v2 and ai_dj.is_active(guild_id_v2):
+            dj_reason = getattr(track, "_dj_reason", None)
+            explore_flag = bool(getattr(track, "_dj_exploration", False))
+            model_ver = str(getattr(track, "_dj_model_version", "") or "").strip()
+            badge = " | Explore" if explore_flag else ""
+            model_txt = f" [{model_ver.upper()}]" if model_ver else ""
+            if dj_reason:
+                dj_meta = f"`AI DJ{model_txt}`{badge} | {dj_reason}"
+            else:
+                dj_meta = f"`AI DJ{model_txt}`{badge} | Curating your queue"
+        self._v2_meta_text.content = dj_meta
         self._v2_progress_text.content = f"{_PLAYBAR_LEFT_PAD}`{block_bar}  {timer_text}`"
         artwork_url = str(getattr(track, "artwork", "") or "").strip()
         thumbnail_cls = getattr(discord.ui, "Thumbnail", None)
@@ -1368,6 +1459,18 @@ class SpotifyUI(_DashboardBaseView):
         self.shuffle_queue.disabled = queue_count < 2
         self.open_lyrics.disabled = not has_current
 
+        # AI DJ button sync
+        from utils.dj import dj as ai_dj
+        guild = getattr(self.player, "guild", None)
+        guild_id = getattr(guild, "id", 0) if guild else 0
+        dj_active = ai_dj.is_active(guild_id) if guild_id else False
+        if dj_active:
+            self.toggle_dj.style = discord.ButtonStyle.success
+            self.toggle_dj.label = "DJ"
+        else:
+            self.toggle_dj.style = discord.ButtonStyle.secondary
+            self.toggle_dj.label = "DJ"
+
         self._sync_v2_dashboard_card()
 
     @staticmethod
@@ -1383,43 +1486,41 @@ class SpotifyUI(_DashboardBaseView):
 
     def _reset_position_anchor(self, position_ms: Optional[int] = None) -> None:
         now = time.monotonic()
-        self._position_anchor_track_key = self._track_key(self.player.current)
         if position_ms is None:
             position_ms = int(getattr(self.player, "position", 0) or 0)
-        self._position_anchor_ms = max(0, int(position_ms))
-        self._position_anchor_at = now
+        # Atomic tuple assignment to avoid torn reads from the refresh loop
+        self._position_anchor = (self._track_key(self.player.current), max(0, int(position_ms)), now)
 
     def _display_position_ms(self) -> int:
         track = self.player.current
         if not track:
-            self._position_anchor_track_key = "none"
-            self._position_anchor_ms = 0
-            self._position_anchor_at = time.monotonic()
+            self._position_anchor = ("none", 0, time.monotonic())
             return 0
 
         track_key = self._track_key(track)
         base = int(getattr(self.player, "position", 0) or 0)
         now = time.monotonic()
 
-        if track_key != self._position_anchor_track_key:
-            self._position_anchor_track_key = track_key
-            self._position_anchor_ms = base
-            self._position_anchor_at = now
+        # Read anchor atomically
+        anchor_key, anchor_ms, anchor_at = self._position_anchor
+
+        if track_key != anchor_key:
+            self._position_anchor = (track_key, base, now)
             return base
 
         # Keep anchor in sync whenever Lavalink gives a newer authoritative position.
-        if base > self._position_anchor_ms:
-            self._position_anchor_ms = base
-            self._position_anchor_at = now
+        if base > anchor_ms:
+            self._position_anchor = (anchor_key, base, now)
+            anchor_ms, anchor_at = base, now
         # Also trust explicit backward seeks/restarts from Lavalink.
-        elif base + 800 < self._position_anchor_ms:
-            self._position_anchor_ms = base
-            self._position_anchor_at = now
+        elif base + 800 < anchor_ms:
+            self._position_anchor = (anchor_key, base, now)
+            anchor_ms, anchor_at = base, now
 
         if bool(getattr(self.player, "paused", False)) or not bool(getattr(self.player, "playing", False)):
             return base
 
-        estimated = self._position_anchor_ms + int((now - self._position_anchor_at) * 1000)
+        estimated = anchor_ms + int((now - anchor_at) * 1000)
         if estimated < base:
             estimated = base
 
@@ -1432,6 +1533,11 @@ class SpotifyUI(_DashboardBaseView):
         current = self.player.current
         track_key = self._track_key(current)
         position_bucket = self._display_position_ms() // 250
+        # AI DJ active state
+        from utils.dj import dj as ai_dj
+        guild = getattr(self.player, "guild", None)
+        guild_id = getattr(guild, "id", 0) if guild else 0
+        dj_active = ai_dj.is_active(guild_id) if guild_id else False
         return (
             track_key,
             position_bucket,
@@ -1440,17 +1546,62 @@ class SpotifyUI(_DashboardBaseView):
             int(self.player.queue.count),
             str(self.player.queue.mode),
             self._active_filter_name(),
+            dj_active,
         )
 
+    def _is_persistently_disconnected(self) -> bool:
+        guild = getattr(self.player, "guild", None)
+        voice_client = getattr(guild, "voice_client", None) if guild else None
+        now = time.monotonic()
+        if voice_client:
+            self._voice_gap_started_at = None
+            self._consecutive_voice_gap_ticks = 0
+            return False
+
+        self._consecutive_voice_gap_ticks += 1
+        if self._voice_gap_started_at is None:
+            self._voice_gap_started_at = now
+
+        queue_obj = getattr(self.player, "queue", None)
+        queue_empty = bool(getattr(queue_obj, "is_empty", True))
+        idle = not bool(getattr(self.player, "current", None)) and queue_empty
+        if not idle:
+            return False
+
+        gap_elapsed = now - float(self._voice_gap_started_at or now)
+        return gap_elapsed >= self._voice_gap_stop_seconds
+
+    async def _maybe_recover_stale_render(self) -> None:
+        track = getattr(self.player, "current", None)
+        if not track or bool(getattr(self.player, "paused", False)):
+            return
+
+        now = time.monotonic()
+        if now - self._last_successful_render_at < self._stale_seconds:
+            return
+        if now - self._last_stale_recovery_at < self._stale_cooldown_seconds:
+            return
+
+        self._last_stale_recovery_at = now
+        logging.warning(
+            "dashboard_stale_watchdog_trigger stale_for=%.2fs %s",
+            now - self._last_successful_render_at,
+            self._dashboard_scope_label(),
+        )
+        try:
+            await self.update_player_message(force=True)
+        except Exception as exc:
+            logging.warning("dashboard_stale_watchdog_update_failed error=%s %s", exc, self._dashboard_scope_label())
+
     async def _auto_refresh_loop(self) -> None:
+        exit_reason = "unknown"
+        logging.info("dashboard_loop_start interval=%.2f %s", self._refresh_interval, self._dashboard_scope_label())
         try:
             while True:
                 await asyncio.sleep(self._refresh_interval)
-                # Stop the refresh loop if the player is no longer connected to voice.
-                # This prevents ghost dashboards from being re-created after /stop.
-                guild = getattr(self.player, "guild", None)
-                if guild and not guild.voice_client:
-                    return
+                if self._is_persistently_disconnected():
+                    exit_reason = "persistent_disconnect_idle"
+                    break
                 if not self.message:
                     # Don't self-heal before the dashboard has ever been posted.
                     # During initial creation, message send/edit can take longer than
@@ -1465,9 +1616,15 @@ class SpotifyUI(_DashboardBaseView):
                 try:
                     await self.update_player_message()
                 except Exception as exc:
-                    logging.debug("Dashboard auto-refresh error (continuing): %s", exc)
+                    logging.warning("dashboard_auto_refresh_error error=%s %s", exc, self._dashboard_scope_label())
+                await self._maybe_recover_stale_render()
         except asyncio.CancelledError:
-            return
+            exit_reason = "cancelled"
+        except Exception as exc:
+            exit_reason = "exception"
+            logging.exception("dashboard_loop_crash error=%s %s", exc, self._dashboard_scope_label())
+        finally:
+            logging.info("dashboard_loop_stop reason=%s %s", exit_reason, self._dashboard_scope_label())
 
     async def _rebind_dashboard_message(self) -> None:
         async with self._rebind_lock:
@@ -1491,13 +1648,21 @@ class SpotifyUI(_DashboardBaseView):
                     self.message = existing_message
                     self._has_ever_bound_message = True
                     self._last_render_key = None
+                    self._consecutive_refresh_failures = 0
+                    self._last_successful_render_at = time.monotonic()
+                    self._last_rendered_track_key = self._track_key(getattr(self.player, "current", None))
+                    logging.info("dashboard_rebind_success mode=reuse_existing %s", self._dashboard_scope_label())
                     return
                 except discord.NotFound:
                     pass
                 except discord.HTTPException as exc:
-                    logging.debug("Dashboard rebind could not reuse existing message: %s", exc)
+                    logging.warning("dashboard_rebind_failure mode=reuse_existing error=%s %s", exc, self._dashboard_scope_label())
                 except Exception as exc:
-                    logging.debug("Dashboard rebind reuse failed unexpectedly: %s", exc)
+                    logging.warning(
+                        "dashboard_rebind_failure mode=reuse_existing_unexpected error=%s %s",
+                        exc,
+                        self._dashboard_scope_label(),
+                    )
 
             home = getattr(self.player, "home", None)
             if not home:
@@ -1509,16 +1674,21 @@ class SpotifyUI(_DashboardBaseView):
                 else:
                     msg = await home.send(embed=self.build_embed(), view=self)
             except Exception as exc:
-                logging.debug("Dashboard rebind failed: %s", exc)
+                logging.warning("dashboard_rebind_failure mode=send_new error=%s %s", exc, self._dashboard_scope_label())
                 return
 
             old_message = self.message
             self.message = msg
             self._has_ever_bound_message = True
+            self._last_render_key = None
+            self._consecutive_refresh_failures = 0
+            self._last_successful_render_at = time.monotonic()
+            self._last_rendered_track_key = self._track_key(getattr(self.player, "current", None))
             try:
                 setattr(self.player, "ui_message", msg)
             except Exception:
                 pass
+            logging.info("dashboard_rebind_success mode=send_new %s", self._dashboard_scope_label())
 
             if old_message and getattr(old_message, "id", None) != getattr(msg, "id", None):
                 try:
@@ -1527,6 +1697,7 @@ class SpotifyUI(_DashboardBaseView):
                     pass
 
     def stop(self) -> None:
+        self._stopped = True
         if self._refresh_task and not self._refresh_task.done():
             self._refresh_task.cancel()
         super().stop()
@@ -1602,26 +1773,72 @@ class SpotifyUI(_DashboardBaseView):
             self._sync_components()
             try:
                 if self._use_v2_layout:
-                    await asyncio.wait_for(self.message.edit(view=self), timeout=8.0)
+                    await asyncio.wait_for(self.message.edit(view=self), timeout=self._edit_timeout_seconds)
                 else:
                     embed = self.build_embed()
-                    await asyncio.wait_for(self.message.edit(embed=embed, view=self), timeout=8.0)
+                    await asyncio.wait_for(
+                        self.message.edit(embed=embed, view=self), timeout=self._edit_timeout_seconds
+                    )
                 self._last_render_key = new_key
+                self._consecutive_refresh_failures = 0
+                self._last_refresh_failure_at = 0.0
+                self._last_successful_render_at = time.monotonic()
+                self._last_rendered_track_key = self._track_key(getattr(self.player, "current", None))
             except asyncio.TimeoutError:
                 self._last_render_key = None
-                logging.debug("Dashboard refresh timed out; keeping current message.")
+                self._consecutive_refresh_failures += 1
+                self._last_refresh_failure_at = time.monotonic()
+                logging.warning(
+                    "dashboard_render_timeout fail_count=%s timeout=%.2fs %s",
+                    self._consecutive_refresh_failures,
+                    self._edit_timeout_seconds,
+                    self._dashboard_scope_label(),
+                )
             except discord.NotFound:
                 self.message = None
                 self._last_render_key = None
+                self._consecutive_refresh_failures += 1
+                self._last_refresh_failure_at = time.monotonic()
+                logging.warning(
+                    "dashboard_render_missing_message fail_count=%s %s",
+                    self._consecutive_refresh_failures,
+                    self._dashboard_scope_label(),
+                )
                 should_rebind = True
             except discord.HTTPException as exc:
                 self._last_render_key = None
+                self._consecutive_refresh_failures += 1
+                self._last_refresh_failure_at = time.monotonic()
                 if int(getattr(exc, "code", 0) or 0) == 10008:
                     # Unknown message: dashboard was removed. Trigger rebind.
                     self.message = None
                     should_rebind = True
+                    logging.warning(
+                        "dashboard_render_http_unknown_message fail_count=%s error=%s %s",
+                        self._consecutive_refresh_failures,
+                        exc,
+                        self._dashboard_scope_label(),
+                    )
                 else:
-                    logging.debug("Dashboard refresh skipped due to transient HTTP error: %s", exc)
+                    logging.warning(
+                        "dashboard_render_http_error fail_count=%s error=%s %s",
+                        self._consecutive_refresh_failures,
+                        exc,
+                        self._dashboard_scope_label(),
+                    )
+
+            if (
+                self._consecutive_refresh_failures >= self._refresh_fail_rebind_threshold
+                and not should_rebind
+            ):
+                should_rebind = True
+                self.message = None
+                logging.warning(
+                    "dashboard_rebind_forced fail_count=%s threshold=%s %s",
+                    self._consecutive_refresh_failures,
+                    self._refresh_fail_rebind_threshold,
+                    self._dashboard_scope_label(),
+                )
 
         if should_rebind:
             await self._rebind_dashboard_message()
@@ -1689,12 +1906,29 @@ class SpotifyUI(_DashboardBaseView):
         block_bar = _progress_bar_blocks(position, length, width=32)
         timer_text = f"{_fmt_ms(position)} / {_fmt_ms(length)}" if length > 0 else "Live Stream"
 
+        # AI DJ indicator
+        dj_line = ""
+        from utils.dj import dj as ai_dj
+        guild = getattr(self.player, "guild", None)
+        guild_id = getattr(guild, "id", 0) if guild else 0
+        if guild_id and ai_dj.is_active(guild_id):
+            dj_reason = getattr(track, "_dj_reason", None)
+            explore_flag = bool(getattr(track, "_dj_exploration", False))
+            model_ver = str(getattr(track, "_dj_model_version", "") or "").strip()
+            badge = " | Explore" if explore_flag else ""
+            model_txt = f" [{model_ver.upper()}]" if model_ver else ""
+            if dj_reason:
+                dj_line = f"\n`AI DJ{model_txt}`{badge} | {dj_reason}"
+            else:
+                dj_line = f"\n`AI DJ{model_txt}`{badge} | Curating your queue"
+
         embed = discord.Embed(
             title="Music Dashboard",
             description=(
                 f"### Now Playing\n"
                 f"{title_line}\n\n"
                 f"{_PLAYBAR_LEFT_PAD}`{block_bar}  {timer_text}`"
+                f"{dj_line}"
             ),
             color=0x2B2D31,
         )
@@ -1876,3 +2110,43 @@ class SpotifyUI(_DashboardBaseView):
             view.message = await interaction.original_response()
         except discord.NotFound:
             pass
+
+    async def toggle_ai_dj(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        player = await self._require_live_player(interaction)
+        if not player:
+            await interaction.response.send_message("No active player.", ephemeral=True)
+            return
+
+        from utils.dj import dj as ai_dj, SeedTrack
+
+        guild = getattr(player, "guild", None)
+        guild_id = getattr(guild, "id", 0) if guild else 0
+        if not guild_id:
+            await interaction.response.send_message("Could not determine guild.", ephemeral=True)
+            return
+
+        if ai_dj.is_active(guild_id):
+            # Turn OFF
+            ai_dj.stop_session(guild_id)
+            await interaction.response.defer()
+            await self.update_player_message(force=True)
+        else:
+            # Turn ON — seed with current track
+            seed = None
+            if player.current:
+                seed = SeedTrack(
+                    title=getattr(player.current, "_source_title", None) or player.current.title,
+                    artist=getattr(player.current, "_source_artist", None) or getattr(player.current, "author", "Unknown"),
+                    duration_ms=int(getattr(player.current, "length", 0) or 0),
+                )
+            if not seed:
+                await interaction.response.send_message(
+                    "Play a track first, then enable AI DJ.", ephemeral=True
+                )
+                return
+
+            ai_dj.start_session(guild_id, seed=seed)
+            await interaction.response.defer()
+            # Pre-fetch recommendations immediately
+            ai_dj.trigger_prefetch(guild_id)
+            await self.update_player_message(force=True)

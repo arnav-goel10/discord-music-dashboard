@@ -4,6 +4,7 @@ import wavelink
 import os
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -93,8 +94,30 @@ class MusicBot(_BotBase):
         await super().close()
 
 async def main():
-    # Setup discord logging so we can see when it hits the 429 Rate Limit and how long it waits
-    discord.utils.setup_logging(level=logging.INFO)
+    # Setup logging (console + rotating bot log) so dashboard diagnostics are persisted.
+    os.makedirs("logs", exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+
+    file_handler = RotatingFileHandler(
+        filename=os.path.join("logs", "bot.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    root_logger.addHandler(stream_handler)
+    root_logger.addHandler(file_handler)
+
     print("Enabled Dynamic Rate-Limit Logging. If Discord hits the bot with a 429 Timeout, the logger will read the exact retry_after payload and dynamically wait!")
     
     if not TOKEN or TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
