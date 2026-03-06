@@ -1933,8 +1933,12 @@ class SpotifyUI(_DashboardBaseView):
             color=0x2B2D31,
         )
 
-        if getattr(track, "artwork", None):
-            embed.set_image(url=track.artwork)
+        artwork_url = str(getattr(track, "artwork", "") or "").strip()
+        if artwork_url:
+            embed.set_image(url=artwork_url)
+        else:
+            # Force a deterministic fallback so Discord clients don't keep showing stale artwork.
+            embed.set_image(url=self._default_cover_url())
         return embed
 
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="|◁", row=0)

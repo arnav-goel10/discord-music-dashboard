@@ -119,6 +119,7 @@ class Music(commands.Cog):
         self._dj_track_start_at: dict[int, float] = {}
         self._dj_track_info: dict[int, dict] = {}  # {title, artist, duration_ms, source}
         self._dj_auto_queue_tasks: dict[int, asyncio.Task] = {}
+        self._dj_prequeue_tasks: dict[int, asyncio.Task] = {}
         self._cache_db_path = os.path.join(_DATA_DIR, "music_bot.db")
         self._resolved_links_cache_enabled = (
             os.getenv("RESOLVED_TRACK_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -2266,11 +2267,67 @@ class Music(commands.Cog):
         # AI DJ cleanup
         self._dj_track_start_at.pop(scope_id, None)
         self._dj_track_info.pop(scope_id, None)
+        prequeue_task = self._dj_prequeue_tasks.pop(scope_id, None)
+        if prequeue_task and not prequeue_task.done():
+            prequeue_task.cancel()
         dj_task = self._dj_auto_queue_tasks.pop(scope_id, None)
         if dj_task and not dj_task.done():
             dj_task.cancel()
         from utils.dj import dj as ai_dj
         ai_dj.stop_session(scope_id)
+
+    @staticmethod
+    def _track_runtime_key(track: Any) -> str:
+        return str(
+            getattr(track, "identifier", None)
+            or getattr(track, "uri", None)
+            or getattr(track, "title", None)
+            or "none"
+        )
+
+    def _schedule_dj_prequeue(self, player: wavelink.Player, track: Any) -> None:
+        """Start resolving next AI DJ track ~5s before current track ends."""
+        scope_id = self._player_scope_id(player)
+
+        existing = self._dj_prequeue_tasks.pop(scope_id, None)
+        if existing and not existing.done():
+            existing.cancel()
+
+        length_ms = int(getattr(track, "length", 0) or 0)
+        if length_ms <= 0:
+            return
+
+        delay_seconds = max(0.0, (length_ms / 1000.0) - 5.0)
+        track_key = self._track_runtime_key(track)
+
+        async def _prepare_next() -> None:
+            try:
+                await asyncio.sleep(delay_seconds)
+                current = getattr(player, "current", None)
+                if not current:
+                    return
+                if self._track_runtime_key(current) != track_key:
+                    return
+                if not bool(getattr(player, "playing", False)):
+                    return
+                if not bool(getattr(player.queue, "is_empty", True)):
+                    return
+
+                from utils.dj import dj as ai_dj
+                if not ai_dj.is_active(scope_id):
+                    return
+
+                await self._dj_auto_queue_next(player)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.debug("AI DJ prequeue scheduling failed for scope %s: %s", scope_id, exc)
+            finally:
+                active = self._dj_prequeue_tasks.get(scope_id)
+                if active is asyncio.current_task():
+                    self._dj_prequeue_tasks.pop(scope_id, None)
+
+        self._dj_prequeue_tasks[scope_id] = asyncio.create_task(_prepare_next())
 
     def _set_queue_busy(self, player: wavelink.Player, reason: str) -> None:
         scope_id = self._player_scope_id(player)
@@ -2647,6 +2704,8 @@ class Music(commands.Cog):
                 )
                 # Pre-fetch next recommendations while current track plays
                 ai_dj.trigger_prefetch(scope_id)
+                # Resolve and queue the next AI DJ track ~5 seconds before end for seamless handoff.
+                self._schedule_dj_prequeue(player, track)
 
         # Signal any pending track_end fallback that Lavalink handled auto-advance,
         # so it doesn't also pop from the queue.
@@ -2696,6 +2755,9 @@ class Music(commands.Cog):
 
         scope_id = self._player_scope_id(player)
         reason = str(getattr(payload, "reason", "") or "").lower()
+        prequeue_task = self._dj_prequeue_tasks.pop(scope_id, None)
+        if prequeue_task and not prequeue_task.done():
+            prequeue_task.cancel()
 
         # ── AI DJ: record listen event ──
         await self._dj_record_track_end(scope_id, player, reason)
