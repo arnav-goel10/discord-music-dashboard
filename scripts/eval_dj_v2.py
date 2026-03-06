@@ -31,7 +31,7 @@ def evaluate(db_path: str, *, k: int) -> dict[str, float]:
     with _db_connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT ranked_json, chosen_track_id, outcome_json, served_model
+            SELECT ranked_json, chosen_track_id, outcome_json
             FROM dj_recs_audit_v2
             ORDER BY created_at DESC
             LIMIT 50000
@@ -43,8 +43,6 @@ def evaluate(db_path: str, *, k: int) -> dict[str, float]:
     ndcg = 0.0
     mrr = 0.0
     skip1 = 0.0
-    shadow_n = 0
-
     for row in rows:
         ranked = _safe_json(row["ranked_json"], [])
         chosen = str(row["chosen_track_id"] or "").strip()
@@ -79,10 +77,6 @@ def evaluate(db_path: str, *, k: int) -> dict[str, float]:
         mrr += mrr_at_k(rec_ids, target, k=k)
         skip1 += skip_at_1(was_skip)
 
-        model = str(row["served_model"] or "")
-        if "shadow" in model:
-            shadow_n += 1
-
     if n == 0:
         return {
             "samples": 0,
@@ -91,7 +85,6 @@ def evaluate(db_path: str, *, k: int) -> dict[str, float]:
             "ndcg_at_k": 0.0,
             "mrr_at_k": 0.0,
             "skip_at_1": 0.0,
-            "shadow_samples": 0,
         }
 
     return {
@@ -101,7 +94,6 @@ def evaluate(db_path: str, *, k: int) -> dict[str, float]:
         "ndcg_at_k": ndcg / n,
         "mrr_at_k": mrr / n,
         "skip_at_1": skip1 / n,
-        "shadow_samples": shadow_n,
     }
 
 

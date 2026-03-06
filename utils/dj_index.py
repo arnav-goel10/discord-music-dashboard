@@ -190,7 +190,7 @@ class LocalVectorStore:
                     f.write(
                         json.dumps(
                             {
-                                "format": "faiss_fallback_v1",
+                                "format": "faiss_fallback_v2",
                                 "updated_at": time.time(),
                                 "note": "sqlite-backed vector snapshot placeholder",
                             },
@@ -353,7 +353,7 @@ class HybridTrackIndex:
         db_path: str,
         backend: str,
         qdrant_url: str,
-        collection: str = "tracks_v1",
+        collection: str = "tracks_v2",
         embedding_dim: int = 256,
         snapshot_path: str,
         embed_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",

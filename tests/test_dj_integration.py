@@ -11,8 +11,6 @@ class TestAIDJIntegration(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self._tmpdir.name, "dj_test.db")
 
         os.environ["DJ_DB_PATH"] = self.db_path
-        os.environ["DJ_ALGO_VERSION"] = "v2"
-        os.environ["DJ_SHADOW_MODE"] = "0"
         os.environ["DJ_VECTOR_BACKEND"] = "faiss"
         os.environ["DJ_CANDIDATE_POOL_SIZE"] = "40"
         os.environ["DJ_RANK_TOPK"] = "20"

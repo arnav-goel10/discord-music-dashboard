@@ -4,8 +4,6 @@ v2 uses a multi-stage recommender:
 - Hybrid retrieval (semantic ANN + sequential + graph + rule pools)
 - Contextual utility ranking with bandit exploration bonus
 - MMR slate reranking with diversity constraints
-
-A v1 heuristic fallback is retained for shadow/canary rollout safety.
 """
 
 from __future__ import annotations
@@ -76,24 +74,6 @@ class RecommendedTrack:
 
 
 @dataclass
-class Candidate:
-    """Legacy candidate object used by v1 fallback scoring."""
-
-    title: str
-    artist: str
-    lastfm_similar_score: float = 0.0
-    artist_similarity_score: float = 0.0
-    tag_similarity: float = 0.0
-    cooccurrence_score: float = 0.0
-    skip_penalty: float = 0.0
-    completion_bonus: float = 0.0
-    recency_penalty: float = 0.0
-    source: str = ""
-    reason: str = ""
-    final_score: float = 0.0
-
-
-@dataclass
 class DJSession:
     guild_id: int
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -107,7 +87,6 @@ class DJSession:
     recent_artist_history: list[str] = field(default_factory=list)
     skip_streak: int = 0
     completion_streak: int = 0
-    canary_enabled: bool = False
     last_audit_event_id: str = ""
     last_activity_at: float = field(default_factory=time.time)
     _prefetch_task: Optional[asyncio.Task] = field(default=None, repr=False)
@@ -411,14 +390,6 @@ class CandidateRetriever:
 
 
 class AIDJ:
-    # v1 fallback weights
-    W_LASTFM_SIMILAR = 35.0
-    W_ARTIST_SIMILARITY = 20.0
-    W_TAG_SIMILARITY = 15.0
-    W_COOCCURRENCE = 15.0
-    W_SKIP_PENALTY = 25.0
-    W_COMPLETION_BONUS = 10.0
-
     def __init__(self):
         self._db_path = _DB_PATH
         self._lastfm: Optional[LastFMClient] = None
@@ -433,7 +404,6 @@ class AIDJ:
         self._history_days = self._env_int("DJ_HISTORY_WEIGHT_DAYS", 30, minimum=1)
         self._similar_cache_ttl = self._env_int("DJ_SIMILAR_CACHE_TTL_SECONDS", 604_800, minimum=3600)
 
-        self._algo_version = (os.getenv("DJ_ALGO_VERSION", "v2") or "v2").strip().lower()
         self._vector_backend = (os.getenv("DJ_VECTOR_BACKEND", "qdrant") or "qdrant").strip().lower()
         self._qdrant_url = (os.getenv("DJ_QDRANT_URL") or "").strip()
         self._candidate_pool_size = self._env_int("DJ_CANDIDATE_POOL_SIZE", 300, minimum=30, maximum=700)
@@ -442,8 +412,6 @@ class AIDJ:
         self._bandit_alpha = self._env_float("DJ_BANDIT_ALPHA", 0.24, minimum=0.0)
         self._mmr_lambda = self._env_float("DJ_MMR_LAMBDA", 0.65, minimum=0.05, maximum=0.95)
         self._global_signal_enabled = self._env_bool("DJ_GLOBAL_SIGNAL_ENABLED", True)
-        self._shadow_mode = self._env_bool("DJ_SHADOW_MODE", True)
-        self._canary_percent = self._env_int("DJ_CANARY_PERCENT", 0, minimum=0, maximum=100)
         self._resolver_rrf_k = self._env_int("TRACK_RESOLVER_RRF_K", 20, minimum=1)
 
         self._sessions: dict[int, DJSession] = {}
@@ -464,7 +432,7 @@ class AIDJ:
             db_path=self._db_path,
             backend=self._vector_backend,
             qdrant_url=self._qdrant_url,
-            snapshot_path=os.path.join(_DATA_DIR, "faiss_tracks_v1.index"),
+            snapshot_path=os.path.join(_DATA_DIR, "faiss_tracks_v2.index"),
             embedding_dim=self._env_int("DJ_EMBEDDING_DIM", 256, minimum=64, maximum=1536),
             embed_model_name=(
                 os.getenv("DJ_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -630,15 +598,71 @@ class AIDJ:
     def _title_artist_key(title: str, artist: str) -> str:
         return f"{str(artist).lower().strip()} - {str(title).lower().strip()}"
 
-    @staticmethod
-    def _guild_bucket(guild_id: int) -> int:
-        digest = hashlib.md5(str(guild_id).encode("utf-8")).hexdigest()
-        return int(digest[:8], 16) % 100
+    async def _get_cooccurrence_candidates(
+        self,
+        guild_id: int,
+        seeds: list[SeedTrack],
+        *,
+        limit: int = 20,
+    ) -> list[tuple[dict[str, Any], float]]:
+        if not seeds:
+            return []
 
-    def _is_canary_enabled(self, guild_id: int) -> bool:
-        if self._canary_percent <= 0:
-            return False
-        return self._guild_bucket(guild_id) < self._canary_percent
+        seed_keys = [(s.artist.lower(), s.title.lower()) for s in seeds]
+
+        def _query() -> list[tuple[dict[str, Any], float]]:
+            results: list[tuple[dict[str, Any], float]] = []
+            cutoff = time.time() - (self._history_days * 86400)
+            try:
+                with self._db_connect() as conn:
+                    seed_conditions = " OR ".join(
+                        "(LOWER(track_artist) = ? AND LOWER(track_title) = ?)"
+                        for _ in seed_keys
+                    )
+                    params: list[Any] = []
+                    for ak, tk in seed_keys:
+                        params.extend([ak, tk])
+
+                    sessions = conn.execute(
+                        f"""
+                        SELECT DISTINCT session_id
+                        FROM dj_listen_history
+                        WHERE guild_id = ? AND created_at > ? AND session_id != ''
+                        AND ({seed_conditions})
+                        """,
+                        [guild_id, cutoff] + params,
+                    ).fetchall()
+                    session_ids = [str(r["session_id"]) for r in sessions if str(r["session_id"]).strip()]
+                    if not session_ids:
+                        return results
+
+                    placeholders = ",".join("?" for _ in session_ids)
+                    rows = conn.execute(
+                        f"""
+                        SELECT track_artist, track_title, COUNT(*) AS freq
+                        FROM dj_listen_history
+                        WHERE guild_id = ? AND session_id IN ({placeholders}) AND was_skipped = 0
+                        GROUP BY LOWER(track_artist), LOWER(track_title)
+                        ORDER BY freq DESC
+                        LIMIT ?
+                        """,
+                        [guild_id] + session_ids + [limit * 2],
+                    ).fetchall()
+
+                    seed_set = {f"{a} - {t}" for a, t in seed_keys}
+                    for row in rows:
+                        key = f"{str(row['track_artist']).lower()} - {str(row['track_title']).lower()}"
+                        if key in seed_set:
+                            continue
+                        score = min(1.0, float(row["freq"] or 0.0) / 5.0)
+                        results.append(({"title": str(row["track_title"]), "artist": str(row["track_artist"])}, score))
+                        if len(results) >= limit:
+                            break
+            except Exception as exc:
+                logger.debug("Co-occurrence query error: %s", exc)
+            return results
+
+        return await asyncio.to_thread(_query)
 
     @staticmethod
     def _source_entropy(rows: list[RankedCandidate]) -> float:
@@ -737,13 +761,12 @@ class AIDJ:
             old._prefetch_task.cancel()
 
         session = DJSession(guild_id=guild_id)
-        session.canary_enabled = self._is_canary_enabled(guild_id)
         if seed:
             session.seed_tracks.append(seed)
             session.recent_artist_history.append(seed.artist)
             session.recent_artist_history = session.recent_artist_history[-20:]
         self._sessions[guild_id] = session
-        logger.info("AI DJ session started for guild %s (canary=%s)", guild_id, session.canary_enabled)
+        logger.info("AI DJ session started for guild %s", guild_id)
         return session
 
     def stop_session(self, guild_id: int) -> None:
@@ -1442,7 +1465,7 @@ class AIDJ:
                     )
 
         # Guild-local co-occurrence fallback pool.
-        cooc = await self._legacy_get_cooccurrence_candidates(guild_id, seeds, limit=min(60, limit // 2))
+        cooc = await self._get_cooccurrence_candidates(guild_id, seeds, limit=min(60, limit // 2))
         for track, score in cooc:
             _add(
                 str(track.get("title") or "").strip(),
@@ -1627,43 +1650,19 @@ class AIDJ:
         if count <= 0:
             count = self._prefetch_count
 
-        use_v2 = self._algo_version == "v2"
-        serve_v2 = use_v2 and (not self._shadow_mode or session.canary_enabled)
+        try:
+            recs_v2 = await self._get_recommendations_v2(guild_id, count=count)
+        except Exception as exc:
+            logger.warning("AI DJ v2 recommendation failed: %s", exc)
+            return []
 
-        recs_v2: list[RecommendedTrack] = []
-        if use_v2:
-            try:
-                recs_v2 = await self._get_recommendations_v2(guild_id, count=count)
-            except Exception as exc:
-                logger.warning("AI DJ v2 recommendation failed, falling back: %s", exc)
-                recs_v2 = []
-
-        if serve_v2 and recs_v2:
+        if recs_v2:
             session.last_audit_event_id = await self._write_recommendation_audit(
                 guild_id,
                 session,
                 served_model="v2",
                 ranked=recs_v2,
             )
-            return recs_v2
-
-        # Shadow mode / fallback path.
-        recs_v1 = await self._get_recommendations_v1(guild_id, count=count)
-        if recs_v2:
-            await self._write_recommendation_audit(
-                guild_id,
-                session,
-                served_model="v1_shadow_v2_logged",
-                ranked=recs_v2,
-            )
-        if recs_v1:
-            session.last_audit_event_id = await self._write_recommendation_audit(
-                guild_id,
-                session,
-                served_model="v1",
-                ranked=recs_v1,
-            )
-            return recs_v1
         return recs_v2
 
     async def pop_next_recommendation(self, guild_id: int) -> Optional[RecommendedTrack]:
@@ -1716,272 +1715,6 @@ class AIDJ:
                 logger.debug("AI DJ prefetch error: %s", exc)
 
         session._prefetch_task = asyncio.create_task(_prefetch())
-
-    # ------------------------------------------------------------------
-    # v1 fallback
-    # ------------------------------------------------------------------
-
-    async def _legacy_get_cooccurrence_candidates(
-        self,
-        guild_id: int,
-        seeds: list[SeedTrack],
-        *,
-        limit: int = 20,
-    ) -> list[tuple[dict[str, Any], float]]:
-        if not seeds:
-            return []
-
-        seed_keys = [(s.artist.lower(), s.title.lower()) for s in seeds]
-
-        def _query() -> list[tuple[dict[str, Any], float]]:
-            results: list[tuple[dict[str, Any], float]] = []
-            cutoff = time.time() - (self._history_days * 86400)
-            try:
-                with self._db_connect() as conn:
-                    seed_conditions = " OR ".join(
-                        "(LOWER(track_artist) = ? AND LOWER(track_title) = ?)"
-                        for _ in seed_keys
-                    )
-                    params: list[Any] = []
-                    for ak, tk in seed_keys:
-                        params.extend([ak, tk])
-
-                    sessions = conn.execute(
-                        f"""
-                        SELECT DISTINCT session_id
-                        FROM dj_listen_history
-                        WHERE guild_id = ? AND created_at > ? AND session_id != ''
-                        AND ({seed_conditions})
-                        """,
-                        [guild_id, cutoff] + params,
-                    ).fetchall()
-                    session_ids = [str(r["session_id"]) for r in sessions if str(r["session_id"]).strip()]
-                    if not session_ids:
-                        return results
-
-                    placeholders = ",".join("?" for _ in session_ids)
-                    rows = conn.execute(
-                        f"""
-                        SELECT track_artist, track_title, COUNT(*) AS freq
-                        FROM dj_listen_history
-                        WHERE guild_id = ? AND session_id IN ({placeholders}) AND was_skipped = 0
-                        GROUP BY LOWER(track_artist), LOWER(track_title)
-                        ORDER BY freq DESC
-                        LIMIT ?
-                        """,
-                        [guild_id] + session_ids + [limit * 2],
-                    ).fetchall()
-
-                    seed_set = {f"{a} - {t}" for a, t in seed_keys}
-                    for row in rows:
-                        key = f"{str(row['track_artist']).lower()} - {str(row['track_title']).lower()}"
-                        if key in seed_set:
-                            continue
-                        score = min(1.0, float(row["freq"] or 0.0) / 5.0)
-                        results.append(({"title": str(row["track_title"]), "artist": str(row["track_artist"])}, score))
-                        if len(results) >= limit:
-                            break
-            except Exception as exc:
-                logger.debug("Legacy co-occurrence query error: %s", exc)
-            return results
-
-        return await asyncio.to_thread(_query)
-
-    async def _legacy_generate_candidates(self, guild_id: int, seeds: list[SeedTrack]) -> dict[str, Candidate]:
-        candidates: dict[str, Candidate] = {}
-
-        def _add(title: str, artist: str) -> Candidate:
-            key = self._title_artist_key(title, artist)
-            if key not in candidates:
-                candidates[key] = Candidate(title=title, artist=artist)
-            return candidates[key]
-
-        if not self._lastfm:
-            cooc = await self._legacy_get_cooccurrence_candidates(guild_id, seeds)
-            for track, score in cooc:
-                c = _add(track["title"], track["artist"])
-                c.cooccurrence_score = max(c.cooccurrence_score, float(score))
-                c.source = c.source or "cooccurrence"
-                c.reason = c.reason or "Played together with your tracks"
-            return candidates
-
-        tasks = []
-
-        async def _fetch_similar(seed: SeedTrack, weight: float) -> None:
-            cache_key = f"similar:{seed.artist.lower()}|{seed.title.lower()}"
-            rows = await self._cached_lastfm_call(
-                cache_key,
-                "track.getSimilar",
-                lambda s=seed: self._lastfm.track_get_similar(s.artist, s.title, limit=30),
-            )
-            for row in rows:
-                c = _add(str(row.get("title") or ""), str(row.get("artist") or ""))
-                c.lastfm_similar_score += float(row.get("match") or 0.0) * weight
-                if not c.source:
-                    c.source = "lastfm_similar"
-                    c.reason = f"Similar to {seed.title}"
-
-        recent_seeds = seeds[-3:]
-        for i, seed in enumerate(recent_seeds):
-            weight = 1.0 * (0.7 ** (len(recent_seeds) - 1 - i))
-            tasks.append(_fetch_similar(seed, weight))
-
-        async def _fetch_artist_tracks(seed: SeedTrack) -> None:
-            cache_key = f"artist_similar:{seed.artist.lower()}"
-            artists = await self._cached_lastfm_call(
-                cache_key,
-                "artist.getSimilar",
-                lambda s=seed: self._lastfm.artist_get_similar(s.artist, limit=10),
-            )
-            for art in artists[:7]:
-                name = str(art.get("name") or "").strip()
-                if not name:
-                    continue
-                top_key = f"artist_top:{name.lower()}"
-                top_tracks = await self._cached_lastfm_call(
-                    top_key,
-                    "artist.getTopTracks",
-                    lambda n=name: self._lastfm.artist_get_top_tracks(n, limit=5),
-                )
-                for t in top_tracks:
-                    c = _add(str(t.get("title") or ""), str(t.get("artist") or ""))
-                    c.artist_similarity_score = max(c.artist_similarity_score, float(art.get("match") or 0.0) * 0.6)
-                    if not c.source:
-                        c.source = "lastfm_artist"
-                        c.reason = f"Top track by {t.get('artist', '')}"
-
-        for seed in seeds[-2:]:
-            tasks.append(_fetch_artist_tracks(seed))
-
-        async def _fetch_tag_tracks(seed: SeedTrack) -> None:
-            tags = await self._get_track_tags(seed.artist, seed.title)
-            for tag in tags[:2]:
-                tag_name = str(tag.get("name") or "").strip()
-                if not tag_name:
-                    continue
-                key = f"tag_top:{tag_name}"
-                tag_tracks = await self._cached_lastfm_call(
-                    key,
-                    "tag.getTopTracks",
-                    lambda t=tag_name: self._lastfm.tag_get_top_tracks(t, limit=10),
-                )
-                for t in tag_tracks:
-                    c = _add(str(t.get("title") or ""), str(t.get("artist") or ""))
-                    c.tag_similarity += 0.5
-                    if not c.source:
-                        c.source = "lastfm_tag"
-                        c.reason = f"Also tagged '{tag_name}'"
-
-        if seeds:
-            tasks.append(_fetch_tag_tracks(seeds[-1]))
-
-        async def _fetch_cooc() -> None:
-            rows = await self._legacy_get_cooccurrence_candidates(guild_id, seeds)
-            for track, score in rows:
-                c = _add(track["title"], track["artist"])
-                c.cooccurrence_score = max(c.cooccurrence_score, float(score))
-                if not c.source:
-                    c.source = "cooccurrence"
-                    c.reason = "Previously played with your tracks"
-
-        tasks.append(_fetch_cooc())
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        return candidates
-
-    def _legacy_score_candidates(self, candidates: dict[str, Candidate], guild_id: int, session: DJSession) -> list[Candidate]:
-        guild_stats = self._load_guild_stats(guild_id)
-        seed_keys = {self._title_artist_key(seed.title, seed.artist) for seed in session.seed_tracks}
-
-        scored: list[Candidate] = []
-        now = time.time()
-        for key, c in candidates.items():
-            if key in seed_keys or key in session.played_titles:
-                continue
-
-            score = 0.0
-            score += c.lastfm_similar_score * self.W_LASTFM_SIMILAR
-            score += c.artist_similarity_score * self.W_ARTIST_SIMILARITY
-            score += c.tag_similarity * self.W_TAG_SIMILARITY
-            score += c.cooccurrence_score * self.W_COOCCURRENCE
-
-            stats = guild_stats.get(key)
-            if stats:
-                c.skip_penalty = float(stats.get("skip_rate", 0.0) or 0.0)
-                c.completion_bonus = float(stats.get("completion_rate", 0.0) or 0.0)
-                score -= c.skip_penalty * self.W_SKIP_PENALTY
-                score += c.completion_bonus * self.W_COMPLETION_BONUS
-
-                hours = (now - float(stats.get("last_played", 0.0) or 0.0)) / 3600.0
-                if hours < 1:
-                    c.recency_penalty = 30.0
-                elif hours < 4:
-                    c.recency_penalty = 15.0
-                elif hours < 24:
-                    c.recency_penalty = 5.0
-                score -= c.recency_penalty
-
-            if key in session.skipped_titles:
-                score -= 40.0
-
-            c.final_score = score
-            scored.append(c)
-
-        scored.sort(key=lambda row: row.final_score, reverse=True)
-        return scored
-
-    @staticmethod
-    def _legacy_apply_diversity(
-        ranked: list[Candidate],
-        seeds: list[SeedTrack],
-        *,
-        max_results: int,
-        max_per_artist: int = 1,
-    ) -> list[Candidate]:
-        selected: list[Candidate] = []
-        artist_counts: dict[str, int] = {}
-        seed_artists = {str(s.artist).lower() for s in seeds[-3:]}
-
-        for c in ranked:
-            artist_key = c.artist.lower()
-            count = artist_counts.get(artist_key, 0)
-            if artist_key in seed_artists and count >= max_per_artist:
-                continue
-            if count >= max_per_artist + 1:
-                continue
-            selected.append(c)
-            artist_counts[artist_key] = count + 1
-            if len(selected) >= max_results:
-                break
-
-        return selected
-
-    async def _get_recommendations_v1(self, guild_id: int, *, count: int) -> list[RecommendedTrack]:
-        session = self._sessions.get(guild_id)
-        if not session or not session.active or not session.seed_tracks:
-            return []
-
-        candidates = await self._legacy_generate_candidates(guild_id, session.seed_tracks)
-        if not candidates:
-            return []
-
-        scored = self._legacy_score_candidates(candidates, guild_id, session)
-        diverse = self._legacy_apply_diversity(scored, session.seed_tracks, max_results=count)
-
-        out: list[RecommendedTrack] = []
-        for row in diverse:
-            out.append(
-                RecommendedTrack(
-                    title=row.title,
-                    artist=row.artist,
-                    score=row.final_score,
-                    source=row.source,
-                    reason=row.reason,
-                    model_version="v1",
-                    candidate_sources=[row.source] if row.source else [],
-                )
-            )
-        return out
 
     async def close(self) -> None:
         for guild_id in list(self._sessions):
