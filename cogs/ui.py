@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import time
+import datetime
 import re
 import sqlite3
 import discord
@@ -11,7 +12,7 @@ from typing import Optional, Any
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 _PLAYLIST_DB_PATH = os.path.join(_DATA_DIR, "music_bot.db")
 _SAVED_PLAYLIST_DB_READY = False
-_MAX_SAVED_PLAYLISTS = 3
+_MAX_SAVED_PLAYLISTS = 1
 _PLAYBAR_LEFT_PAD = "\u2002\u2002"
 
 _HAS_LAYOUT_V2 = all(
@@ -174,6 +175,53 @@ def _normalize_scope_id(raw: Any) -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return 0
+
+
+def _parse_spotify_timestamp(raw_value: Optional[str]) -> Optional[float]:
+    if not isinstance(raw_value, str):
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def _order_playlist_preview_tracks(tracks: list[Any], play_order: str) -> tuple[list[Any], str]:
+    if str(play_order or "recent").strip().lower() != "recent":
+        return list(tracks), "Spotify Order"
+
+    with_timestamp: list[tuple[int, float, Any]] = []
+    without_timestamp: list[tuple[int, Any]] = []
+
+    for idx, track in enumerate(tracks):
+        ts = _parse_spotify_timestamp(getattr(track, "added_at", None))
+        if ts is None:
+            without_timestamp.append((idx, track))
+            continue
+        with_timestamp.append((idx, ts, track))
+
+    with_timestamp.sort(key=lambda item: item[1], reverse=True)
+
+    ordered = [track for _, _, track in with_timestamp]
+    ordered.extend(track for _, track in reversed(without_timestamp))
+
+    order_label = "Recently Added"
+    if ordered and not with_timestamp:
+        order_label = "Recently Added (Approximate)"
+    return ordered, order_label
+
+
+def _saved_playlist_title() -> str:
+    return "Saved playlist" if _MAX_SAVED_PLAYLISTS == 1 else "Saved playlists"
+
+
+def _saved_playlist_limit_label() -> str:
+    return "saved playlist" if _MAX_SAVED_PLAYLISTS == 1 else "saved playlists"
 
 
 def _sanitize_saved_playlist_items(raw_items: Any) -> list[dict[str, Any]]:
@@ -353,8 +401,8 @@ class SavePlaylistModal(discord.ui.Modal, title="Save Spotify Playlist"):
         token = _playlist_token_from_url(url)
         if trimmed:
             message = (
-                f"Saved playlist `{token}`. Kept most recent {_MAX_SAVED_PLAYLISTS} saved lists "
-                "(oldest one was removed)."
+                f"Saved playlist `{token}`. Kept most recent {_MAX_SAVED_PLAYLISTS} "
+                f"{_saved_playlist_limit_label()} (older one was removed)."
             )
         else:
             message = f"Saved playlist `{token}`."
@@ -364,6 +412,7 @@ class SavePlaylistModal(discord.ui.Modal, title="Save Spotify Playlist"):
         if self.parent_view:
             self.parent_view.playlists = playlists
             self.parent_view.selected_index = 0
+            await self.parent_view.refresh_preview(force_update=self.parent_view.play_order == "recent")
             await self.parent_view.refresh_message()
 
 
@@ -422,6 +471,7 @@ class EditSavedPlaylistModal(discord.ui.Modal, title="Edit Saved Playlist URL"):
         self.parent_view.selected_index = min(self.index, len(deduped) - 1) if deduped else -1
 
         await interaction.response.send_message("Saved playlist URL updated.", ephemeral=True)
+        await self.parent_view.refresh_preview(force_update=self.parent_view.play_order == "recent")
         await self.parent_view.refresh_message()
 
 
@@ -434,6 +484,9 @@ class SavedPlaylistManagerView(discord.ui.View):
         self.selected_index: int = 0 if self.playlists else -1
         default_order = str(getattr(self.dashboard, "_saved_playlist_order", "recent") or "recent")
         self.play_order = default_order if default_order in {"recent", "spotify"} else "recent"
+        self.preview_tracks: list[Any] = []
+        self.preview_order_label = self._order_label()
+        self.preview_note = "Preview unavailable until playlist metadata loads."
         self.message: Optional[discord.Message] = None
         self._sync_components()
 
@@ -459,11 +512,11 @@ class SavedPlaylistManagerView(discord.ui.View):
 
     def _build_content(self) -> str:
         lines = [
-            f"Saved playlists (`{len(self.playlists)}/{_MAX_SAVED_PLAYLISTS}`)",
+            f"{_saved_playlist_title()} (`{len(self.playlists)}/{_MAX_SAVED_PLAYLISTS}`)",
             "",
         ]
         if not self.playlists:
-            lines.append("No saved playlists yet. Use **Add New** below.")
+            lines.append("No saved playlist yet. Use **Add** below.")
         else:
             for idx, item in enumerate(self.playlists, start=1):
                 url = str(item.get("url", ""))
@@ -472,6 +525,17 @@ class SavedPlaylistManagerView(discord.ui.View):
                 lines.append(f"{marker} **{idx}.** [`{token}`]({url})")
         lines.append("")
         lines.append(f"Current order: **{self._order_label()}**")
+        if self.selected_index >= 0:
+            lines.append("")
+            lines.append(f"Preview: **{self.preview_order_label}**")
+            if self.preview_tracks:
+                for idx, track in enumerate(self.preview_tracks, start=1):
+                    title = str(getattr(track, "title", "Unknown Title") or "Unknown Title")
+                    artist = _display_artist_name(getattr(track, "artist", "Unknown Artist"))
+                    preview_label = discord.utils.escape_markdown(_clip(f"{title} - {artist}", 80), as_needed=True)
+                    lines.append(f"{idx}. {preview_label}")
+            else:
+                lines.append(self.preview_note)
         return "\n".join(lines)
 
     def _sync_components(self) -> None:
@@ -516,6 +580,48 @@ class SavedPlaylistManagerView(discord.ui.View):
         except Exception:
             pass
 
+    async def refresh_preview(self, *, force_update: bool = False) -> None:
+        url = self._selected_url()
+        self.preview_tracks = []
+        self.preview_order_label = self._order_label()
+        self.preview_note = "Preview unavailable until playlist metadata loads."
+        if not url:
+            self.preview_note = "No saved playlist selected."
+            return
+
+        try:
+            from utils.resolver import resolver
+        except Exception:
+            self.preview_note = "Track preview is temporarily unavailable."
+            return
+
+        try:
+            tracks = []
+            if force_update:
+                tracks = await resolver.get_playlist_tracks(url, force_update=True, force_cache_bypass=False)
+                if not tracks:
+                    tracks = await resolver.get_playlist_tracks(url, force_update=False, force_cache_bypass=True)
+            else:
+                tracks = await resolver.get_playlist_tracks(url, force_update=False, force_cache_bypass=True)
+                if not tracks:
+                    tracks = await resolver.get_playlist_tracks(url, force_update=False, force_cache_bypass=False)
+            if not tracks and not force_update:
+                tracks = await resolver.get_playlist_tracks(url, force_update=True, force_cache_bypass=False)
+        except Exception as exc:
+            logging.debug("Failed refreshing saved playlist preview for %s: %s", url, exc)
+            self.preview_note = "Track preview is temporarily unavailable."
+            return
+
+        if not tracks:
+            self.preview_note = "Track preview unavailable for this playlist right now."
+            return
+
+        ordered_tracks, order_label = _order_playlist_preview_tracks(tracks, self.play_order)
+        self.preview_tracks = ordered_tracks[:5]
+        self.preview_order_label = order_label
+        if not self.preview_tracks:
+            self.preview_note = "No tracks available for preview."
+
     async def on_timeout(self) -> None:
         if self.message:
             try:
@@ -544,6 +650,7 @@ class SavedPlaylistManagerView(discord.ui.View):
 
         self.selected_index = selected_index
         self._sync_components()
+        await self.refresh_preview(force_update=self.play_order == "recent")
         await interaction.response.edit_message(content=self._build_content(), view=self)
 
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="Order: Recently Added", row=1)
@@ -551,9 +658,10 @@ class SavedPlaylistManagerView(discord.ui.View):
         self.play_order = "spotify" if self.play_order == "recent" else "recent"
         setattr(self.dashboard, "_saved_playlist_order", self.play_order)
         self._sync_components()
+        await self.refresh_preview(force_update=self.play_order == "recent")
         await interaction.response.edit_message(content=self._build_content(), view=self)
 
-    @discord.ui.button(style=discord.ButtonStyle.success, emoji=None, label="Play", row=1)
+    @discord.ui.button(style=discord.ButtonStyle.success, emoji=None, label="▶", row=1)
     async def play_selected(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         url = self._selected_url()
         if not url:
@@ -572,6 +680,7 @@ class SavedPlaylistManagerView(discord.ui.View):
                 index=None,
                 force_cache=True,
                 playlist_order=self.play_order,
+                force_playlist_refresh=self.play_order == "recent",
             )
         except Exception as exc:
             logging.exception("Saved playlist play failed: %s", exc)
@@ -583,36 +692,72 @@ class SavedPlaylistManagerView(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="Edit", row=2)
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=None, label="✎", row=2)
     async def edit_selected(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.selected_index < 0 or self.selected_index >= len(self.playlists):
             await interaction.response.send_message("No saved playlist selected.", ephemeral=True)
             return
         await interaction.response.send_modal(EditSavedPlaylistModal(self, self.selected_index))
 
-    @discord.ui.button(style=discord.ButtonStyle.primary, emoji="💾", label="", row=2)
+    @discord.ui.button(style=discord.ButtonStyle.primary, emoji=None, label="＋", row=2)
     async def save_playlist(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(SavePlaylistModal(parent_view=self))
 
-    @discord.ui.button(style=discord.ButtonStyle.danger, emoji="🗑", label="", row=2)
+    @discord.ui.button(style=discord.ButtonStyle.danger, emoji=None, label="🗑", row=2)
     async def delete_selected(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.selected_index < 0 or self.selected_index >= len(self.playlists):
             await interaction.response.send_message("No saved playlist selected.", ephemeral=True)
             return
 
-        removed = self.playlists.pop(self.selected_index)
-        _save_saved_playlists(self.owner_user_id, self.playlists)
-
-        if self.playlists:
-            self.selected_index = min(self.selected_index, len(self.playlists) - 1)
-        else:
-            self.selected_index = -1
-
-        self._sync_components()
-        await interaction.response.edit_message(
-            content=f"Deleted `{_playlist_token_from_url(str(removed.get('url', '')))}`.\n\n{self._build_content()}",
-            view=self,
+        target_url = str(self.playlists[self.selected_index].get("url", ""))
+        await interaction.response.send_message(
+            f"Delete `{_playlist_token_from_url(target_url)}`?",
+            view=ConfirmDeleteSavedPlaylistView(self, target_url),
+            ephemeral=True,
         )
+
+
+class ConfirmDeleteSavedPlaylistView(discord.ui.View):
+    def __init__(self, parent_view: "SavedPlaylistManagerView", target_url: str):
+        super().__init__(timeout=30)
+        self.parent_view = parent_view
+        self.target_url = _normalize_spotify_playlist_url(target_url)
+
+    async def on_timeout(self) -> None:
+        self.stop()
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        delete_index = -1
+        for idx, item in enumerate(self.parent_view.playlists):
+            if _normalize_spotify_playlist_url(str(item.get("url", ""))) == self.target_url:
+                delete_index = idx
+                break
+
+        if delete_index < 0:
+            await interaction.response.edit_message(
+                content="Selected playlist is no longer available.",
+                view=None,
+            )
+            self.stop()
+            return
+
+        removed = self.parent_view.playlists.pop(delete_index)
+        _save_saved_playlists(self.parent_view.owner_user_id, self.parent_view.playlists)
+
+        if self.parent_view.playlists:
+            self.parent_view.selected_index = min(delete_index, len(self.parent_view.playlists) - 1)
+        else:
+            self.parent_view.selected_index = -1
+
+        self.parent_view._sync_components()
+        await self.parent_view.refresh_preview(force_update=self.parent_view.play_order == "recent")
+        await self.parent_view.refresh_message()
+        await interaction.response.edit_message(
+            content=f"Deleted `{_playlist_token_from_url(str(removed.get('url', '')))}`.",
+            view=None,
+        )
+        self.stop()
 
 
 class VolumeModal(discord.ui.Modal, title="Set Volume"):
@@ -922,12 +1067,6 @@ class ConfirmRemoveTracksView(discord.ui.View):
         )
         self.stop()
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Cancelled.", view=None)
-        self.stop()
-
-
 class ConfirmClearView(discord.ui.View):
     def __init__(self, paginator: "QueuePaginatorView"):
         super().__init__(timeout=30)
@@ -968,12 +1107,6 @@ class ConfirmClearView(discord.ui.View):
             content=f"Cleared **{count}** tracks from the queue.", view=None
         )
         self.stop()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Cancelled.", view=None)
-        self.stop()
-
 
 class QueuePaginatorView(discord.ui.View):
     def __init__(
@@ -1036,37 +1169,26 @@ class QueuePaginatorView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="◁", style=discord.ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.page_index > 0:
             self.page_index -= 1
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="▷", style=discord.ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.page_index < self.total_pages - 1:
             self.page_index += 1
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        try:
-            await interaction.delete_original_response()
-        except discord.NotFound:
-            pass
-        except discord.HTTPException:
-            pass
-        self.stop()
-
-    @discord.ui.button(label="Remove Track", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Remove Track", style=discord.ButtonStyle.secondary)
     async def remove_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.player or self.player.queue.is_empty:
             await interaction.response.send_message("The queue is empty.", ephemeral=True)
             return
         await interaction.response.send_modal(RemoveTrackModal(self))
 
-    @discord.ui.button(label="Clear Queue", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="Clear Queue", style=discord.ButtonStyle.danger)
     async def clear_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.player or self.player.queue.is_empty:
             await interaction.response.edit_message(embed=self.build_embed(), view=self)
@@ -1678,6 +1800,7 @@ class SpotifyUI(_DashboardBaseView):
                 return
 
             old_message = self.message
+            player_message = getattr(self.player, "ui_message", None)
             self.message = msg
             self._has_ever_bound_message = True
             self._last_render_key = None
@@ -1690,9 +1813,18 @@ class SpotifyUI(_DashboardBaseView):
                 pass
             logging.info("dashboard_rebind_success mode=send_new %s", self._dashboard_scope_label())
 
-            if old_message and getattr(old_message, "id", None) != getattr(msg, "id", None):
+            stale_messages = []
+            for candidate in (old_message, player_message):
+                if not candidate:
+                    continue
+                if getattr(candidate, "id", None) == getattr(msg, "id", None):
+                    continue
+                if any(getattr(existing, "id", None) == getattr(candidate, "id", None) for existing in stale_messages):
+                    continue
+                stale_messages.append(candidate)
+            for stale_message in stale_messages:
                 try:
-                    await old_message.delete()
+                    await stale_message.delete()
                 except Exception:
                     pass
 
@@ -2089,6 +2221,8 @@ class SpotifyUI(_DashboardBaseView):
             view.message = await interaction.original_response()
         except discord.NotFound:
             pass
+        await view.refresh_preview(force_update=view.play_order == "recent")
+        await view.refresh_message()
 
     @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🔊", label="", row=0)
     async def volume_set(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2132,6 +2266,12 @@ class SpotifyUI(_DashboardBaseView):
         if ai_dj.is_active(guild_id):
             # Turn OFF
             ai_dj.stop_session(guild_id)
+            music_cog = _get_music_cog(interaction)
+            if music_cog and hasattr(music_cog, "_cancel_pending_dj_tasks"):
+                try:
+                    music_cog._cancel_pending_dj_tasks(guild_id)
+                except Exception:
+                    pass
             await interaction.response.defer()
             await self.update_player_message(force=True)
         else:

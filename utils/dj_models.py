@@ -141,19 +141,19 @@ class ContextualRanker:
 
     def __init__(self, *, weights: dict[str, float] | None = None):
         default = {
-            "completion_prob": 0.33,
-            "skip_risk": -0.28,
-            "novelty": 0.19,
-            "session_fit": 0.29,
-            "artist_affinity": 0.11,
-            "semantic_similarity": 0.16,
-            "sequential_affinity": 0.14,
-            "co_listen_strength": 0.12,
+            "completion_prob": 0.36,
+            "skip_risk": -0.34,
+            "novelty": 0.10,
+            "session_fit": 0.31,
+            "artist_affinity": 0.12,
+            "semantic_similarity": 0.17,
+            "sequential_affinity": 0.15,
+            "co_listen_strength": 0.13,
             "rule_affinity": 0.09,
-            "recency_penalty": -0.17,
-            "artist_repetition_penalty": -0.12,
+            "recency_penalty": -0.18,
+            "artist_repetition_penalty": -0.14,
             "resolver_confidence": 0.08,
-            "retrieval_score": 0.21,
+            "retrieval_score": 0.22,
         }
         if weights:
             default.update({k: float(v) for k, v in weights.items()})

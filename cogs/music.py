@@ -2267,14 +2267,34 @@ class Music(commands.Cog):
         # AI DJ cleanup
         self._dj_track_start_at.pop(scope_id, None)
         self._dj_track_info.pop(scope_id, None)
+        self._cancel_pending_dj_tasks(scope_id)
+        from utils.dj import dj as ai_dj
+        ai_dj.stop_session(scope_id)
+
+    async def _delete_dashboard_message(
+        self,
+        message: Any,
+        *,
+        log_context: str,
+    ) -> None:
+        if not message:
+            return
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as exc:
+            logging.debug("Could not delete %s: %s", log_context, exc)
+        except Exception as exc:
+            logging.debug("Could not delete %s: %s", log_context, exc)
+
+    def _cancel_pending_dj_tasks(self, scope_id: int) -> None:
         prequeue_task = self._dj_prequeue_tasks.pop(scope_id, None)
         if prequeue_task and not prequeue_task.done():
             prequeue_task.cancel()
         dj_task = self._dj_auto_queue_tasks.pop(scope_id, None)
         if dj_task and not dj_task.done():
             dj_task.cancel()
-        from utils.dj import dj as ai_dj
-        ai_dj.stop_session(scope_id)
 
     @staticmethod
     def _track_runtime_key(track: Any) -> str:
@@ -2690,6 +2710,7 @@ class Music(commands.Cog):
                 "exploration": bool(getattr(track, "_dj_exploration", False)),
                 "rank_features": dict(getattr(track, "_dj_rank_features", {}) or {}),
                 "candidate_sources": list(getattr(track, "_dj_candidate_sources", []) or []),
+                "audit_event_id": str(getattr(track, "_dj_audit_event_id", "") or ""),
             }
             # Add as seed for the DJ session
             from utils.dj import dj as ai_dj, SeedTrack
@@ -2729,6 +2750,7 @@ class Music(commands.Cog):
                 logging.debug("Could not refresh existing dashboard on track start: %s", exc)
 
         # No existing dashboard — stop any stale view and create a fresh one.
+        old_message = existing_message
         if existing_view:
             try:
                 existing_view.stop()
@@ -2746,6 +2768,11 @@ class Music(commands.Cog):
                 msg = await player.home.send(embed=embed, view=view)
             player.ui_message = msg
             view.message = msg
+            if old_message and getattr(old_message, "id", None) != getattr(msg, "id", None):
+                await self._delete_dashboard_message(
+                    old_message,
+                    log_context="superseded dashboard message on track start",
+                )
 
     @commands.Cog.listener()
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
@@ -2946,6 +2973,13 @@ class Music(commands.Cog):
 
     # ── AI DJ helper methods ────────────────────────────────────────────
 
+    def _dj_skip_threshold_ms(self) -> int:
+        skip_seconds = self._env_int("DJ_SKIP_THRESHOLD_SECONDS", 30, minimum=0)
+        return max(skip_seconds * 1000, 5000)
+
+    def _dj_min_listen_completion_pct(self) -> int:
+        return self._env_int("DJ_MIN_LISTEN_FOR_COMPLETION_PCT", 75, minimum=0, maximum=100)
+
     async def _dj_record_track_end(self, scope_id: int, player: wavelink.Player, reason: str) -> None:
         """Record a listen event when a track ends (naturally or via replacement)."""
         info = self._dj_track_info.pop(scope_id, None)
@@ -2960,13 +2994,10 @@ class Music(commands.Cog):
         was_skipped = False
         if reason in ("replaced", "stopped"):
             # Track was replaced by skip or another track
-            skip_threshold_ms = max(
-                int(os.getenv("DJ_SKIP_THRESHOLD_SECONDS", "30")) * 1000,
-                5000,
-            )
+            skip_threshold_ms = self._dj_skip_threshold_ms()
             if duration_ms > 0:
                 listen_pct = (listened_ms / duration_ms) * 100
-                min_pct = int(os.getenv("DJ_MIN_LISTEN_FOR_COMPLETION_PCT", "75"))
+                min_pct = self._dj_min_listen_completion_pct()
                 was_skipped = listened_ms < skip_threshold_ms or listen_pct < min_pct
             else:
                 was_skipped = listened_ms < skip_threshold_ms
@@ -2999,6 +3030,7 @@ class Music(commands.Cog):
                     "exploration": bool(info.get("exploration", False)),
                     "rank_features": dict(info.get("rank_features", {}) or {}),
                     "candidate_sources": list(info.get("candidate_sources", []) or []),
+                    "audit_event_id": str(info.get("audit_event_id", "") or ""),
                 },
             )
         except Exception as exc:
@@ -3033,6 +3065,7 @@ class Music(commands.Cog):
                 was_skipped=True,
                 skip_position_ms=position_ms,
                 source=info.get("source", "user_queued"),
+                update_session=False,
                 context={
                     "event_reason": "explicit_skip",
                     "queue_size": len(player.queue),
@@ -3040,6 +3073,7 @@ class Music(commands.Cog):
                     "exploration": bool(info.get("exploration", False)),
                     "rank_features": dict(info.get("rank_features", {}) or {}),
                     "candidate_sources": list(info.get("candidate_sources", []) or []),
+                    "audit_event_id": str(info.get("audit_event_id", "") or ""),
                 },
             )
         except Exception as exc:
@@ -3079,10 +3113,14 @@ class Music(commands.Cog):
             if _depth >= 5:
                 logging.debug("AI DJ: exhausted retry depth for guild %s", scope_id)
                 return
+            if not ai_dj.is_active(scope_id):
+                return
             try:
                 rec = await ai_dj.pop_next_recommendation(scope_id)
                 if not rec:
                     logging.debug("AI DJ: no recommendations available for guild %s", scope_id)
+                    return
+                if not ai_dj.is_active(scope_id):
                     return
 
                 logging.info("AI DJ recommending: %s - %s (reason: %s)", rec.artist, rec.title, rec.reason)
@@ -3129,7 +3167,11 @@ class Music(commands.Cog):
                     except Exception:
                         pass
                     logging.debug("AI DJ: failed to resolve '%s - %s', trying next", rec.artist, rec.title)
+                    if not ai_dj.is_active(scope_id):
+                        return
                     return await _do_auto_queue(_depth + 1)
+                if not ai_dj.is_active(scope_id):
+                    return
 
                 # Mark the track as DJ-recommended for signal tracking
                 playable._dj_recommended = True
@@ -3140,6 +3182,7 @@ class Music(commands.Cog):
                 playable._dj_exploration = rec.exploration_flag
                 playable._dj_rank_features = dict(rec.rank_features or {})
                 playable._dj_candidate_sources = list(rec.candidate_sources or [])
+                playable._dj_audit_event_id = str(getattr(rec, "audit_event_id", "") or "")
                 try:
                     await ai_dj.record_resolver_outcome(
                         guild_id=scope_id,
@@ -3158,6 +3201,8 @@ class Music(commands.Cog):
                     pass
 
                 # Queue and play
+                if not ai_dj.is_active(scope_id):
+                    return
                 if not player.playing and not player.current:
                     self._manual_advance_until[scope_id] = time.time() + 2.0
                     await player.play(
@@ -3185,6 +3230,7 @@ class Music(commands.Cog):
         index: int = None,
         force_cache: bool = False,
         playlist_order: str = "recent",
+        force_playlist_refresh: bool = False,
     ):
         if not interaction.guild:
             await self._reply(interaction, "This command can only be used in a server.", ephemeral=True)
@@ -3265,20 +3311,22 @@ class Music(commands.Cog):
                 # The dashboard Lists manager passes force_cache=True so existing
                 # local snapshots can be used immediately even when older than 7 days.
                 tracks = await resolver.get_playlist_tracks(query, force_cache_bypass=force_cache)
-                if (
-                    use_recent_order
-                    and tracks
-                    and all(not getattr(track, "added_at", None) for track in tracks)
-                ):
-                    # Older local snapshots may not include `added_at`. Refresh once so
-                    # "Recently Added" can use real Spotify timestamps when available.
-                    refreshed_tracks = await resolver.get_playlist_tracks(
-                        query,
-                        force_update=True,
-                        force_cache_bypass=False,
+                if use_recent_order and tracks:
+                    has_recent_timestamps = any(
+                        self._parse_spotify_timestamp(getattr(track, "added_at", None)) is not None
+                        for track in tracks
                     )
-                    if refreshed_tracks:
-                        tracks = refreshed_tracks
+                    if force_playlist_refresh or not has_recent_timestamps:
+                        # Saved-playlist "Recently Added" should prefer fresh Spotify
+                        # metadata so the preview and actual play order stay aligned.
+                        # Also refresh older snapshots that never stored `added_at`.
+                        refreshed_tracks = await resolver.get_playlist_tracks(
+                            query,
+                            force_update=True,
+                            force_cache_bypass=False,
+                        )
+                        if refreshed_tracks:
+                            tracks = refreshed_tracks
 
                 if not tracks:
                     failure_code = resolver.last_failure_code

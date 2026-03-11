@@ -91,6 +91,11 @@ class MusicBot(_BotBase):
             await lyrics_resolver.close()
         except Exception as e:
             logging.warning(f"Lyrics resolver cleanup failed: {e}")
+        try:
+            from utils.dj import dj
+            await dj.close()
+        except Exception as e:
+            logging.warning(f"AI DJ cleanup failed: {e}")
         await super().close()
 
 async def main():

@@ -50,6 +50,7 @@ data/resolved_track_links.json
 data/music_bot.db
 data/music_bot.db-shm
 data/music_bot.db-wal
+data/faiss_tracks_v2.index
 
 # Lavalink / plugin binaries (local dependencies)
 Lavalink.jar

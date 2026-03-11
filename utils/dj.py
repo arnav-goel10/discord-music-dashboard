@@ -53,6 +53,17 @@ def _skip_severity(listened_ms: int, duration_ms: int) -> float:
     return math.exp(-3.0 * ratio)
 
 
+def _centered_ts_bonus(ts_sample: float) -> float:
+    """Return a zero-centered Thompson bonus so unseen tracks are neutral by default."""
+    ts = min(1.0, max(0.0, float(ts_sample)))
+    return (ts - 0.5) * 3.0
+
+
+def _is_cold_start(seed_count: int, guild_history_count: int) -> bool:
+    """Limit exploration-heavy cold start to genuinely sparse sessions/history."""
+    return seed_count <= 2 and guild_history_count < 6
+
+
 @dataclass
 class SeedTrack:
     title: str
@@ -64,6 +75,7 @@ class SeedTrack:
 class RecommendedTrack:
     title: str
     artist: str
+    track_id: str = ""
     score: float = 0.0
     source: str = ""
     reason: str = ""
@@ -71,6 +83,7 @@ class RecommendedTrack:
     exploration_flag: bool = False
     model_version: str = "v2"
     candidate_sources: list[str] = field(default_factory=list)
+    audit_event_id: str = ""
 
 
 @dataclass
@@ -409,7 +422,7 @@ class AIDJ:
         self._candidate_pool_size = self._env_int("DJ_CANDIDATE_POOL_SIZE", 300, minimum=30, maximum=700)
         self._rank_topk = self._env_int("DJ_RANK_TOPK", 50, minimum=10, maximum=200)
         self._buffer_size = self._env_int("DJ_BUFFER_SIZE", 10, minimum=2, maximum=40)
-        self._bandit_alpha = self._env_float("DJ_BANDIT_ALPHA", 0.24, minimum=0.0)
+        self._bandit_alpha = self._env_float("DJ_BANDIT_ALPHA", 0.14, minimum=0.0)
         self._mmr_lambda = self._env_float("DJ_MMR_LAMBDA", 0.65, minimum=0.05, maximum=0.95)
         self._global_signal_enabled = self._env_bool("DJ_GLOBAL_SIGNAL_ENABLED", True)
         self._resolver_rrf_k = self._env_int("TRACK_RESOLVER_RRF_K", 20, minimum=1)
@@ -421,7 +434,7 @@ class AIDJ:
         self._session_idle_timeout: float = 6 * 3600.0  # 6 hours
 
         self._feature_builder = FeatureBuilder()
-        self._ranker = ContextualRanker()
+        self._ranker = ContextualRanker(weights=self._load_ranker_weights())
         self._bandit = LinUCBBanditPolicy()
         self._slate = SlateReranker(mmr_lambda=self._mmr_lambda)
 
@@ -442,6 +455,32 @@ class AIDJ:
         self._retriever = CandidateRetriever(self)
 
         self._ensure_tables()
+
+    def _load_ranker_weights(self) -> Optional[dict[str, float]]:
+        weights_path = (
+            os.getenv("DJ_RANKER_WEIGHTS_PATH")
+            or os.path.join(_DATA_DIR, "dj_ranker_weights.json")
+        ).strip()
+        if not weights_path or not os.path.exists(weights_path):
+            return None
+        try:
+            with open(weights_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            weights_raw = payload.get("weights") if isinstance(payload, dict) else None
+            if not isinstance(weights_raw, dict):
+                raise ValueError("missing weights object")
+            weights: dict[str, float] = {}
+            for key, value in weights_raw.items():
+                if not isinstance(key, str):
+                    continue
+                weights[key] = float(value)
+            if not weights:
+                raise ValueError("no valid weights")
+            logger.info("AI DJ loaded trained ranker weights from %s", weights_path)
+            return weights
+        except Exception as exc:
+            logger.warning("AI DJ failed loading ranker weights from %s: %s", weights_path, exc)
+            return None
 
     @staticmethod
     def _env_bool(name: str, default: bool = False) -> bool:
@@ -825,6 +864,9 @@ class AIDJ:
         if not session or not session.active:
             return
         session.last_activity_at = time.time()
+        session.recent_artist_history.append(artist)
+        if len(session.recent_artist_history) > 30:
+            session.recent_artist_history = session.recent_artist_history[-30:]
 
         severity = _skip_severity(listened_ms, duration_ms)
         track_key = self._title_artist_key(title, artist)
@@ -876,6 +918,7 @@ class AIDJ:
         skip_position_ms: int = 0,
         source: str = "user_queued",
         context: Optional[dict[str, Any]] = None,
+        update_session: bool = True,
     ) -> None:
         context = dict(context or {})
         session = self._sessions.get(guild_id)
@@ -889,16 +932,17 @@ class AIDJ:
 
         if session:
             session.last_activity_at = time.time()
-            if is_hard_skip:
-                session.skipped_titles.add(track_key)
-                session.skip_streak += 1
-                session.completion_streak = 0
-            else:
-                session.played_titles.add(track_key)
-                session.skip_streak = 0
-                session.completion_streak += 1
-            session.recent_artist_history.append(artist)
-            session.recent_artist_history = session.recent_artist_history[-30:]
+            if update_session:
+                if is_hard_skip:
+                    session.skipped_titles.add(track_key)
+                    session.skip_streak += 1
+                    session.completion_streak = 0
+                else:
+                    session.played_titles.add(track_key)
+                    session.skip_streak = 0
+                    session.completion_streak += 1
+                session.recent_artist_history.append(artist)
+                session.recent_artist_history = session.recent_artist_history[-30:]
 
         now = time.time()
         event_type = "skip" if was_skipped else "complete"
@@ -1016,9 +1060,12 @@ class AIDJ:
         if session:
             session.recent_track_ids.append(track_id)
             session.recent_track_ids = session.recent_track_ids[-24:]
-            if source == "ai_dj" and session.last_audit_event_id:
+            audit_event_id = str(context.get("audit_event_id") or "").strip()
+            if not audit_event_id:
+                audit_event_id = str(session.last_audit_event_id or "").strip()
+            if source == "ai_dj" and audit_event_id:
                 await self._append_audit_outcome(
-                    session.last_audit_event_id,
+                    audit_event_id,
                     {
                         "event_type": event_type,
                         "track_id": track_id,
@@ -1529,8 +1576,8 @@ class AIDJ:
                 # Scale learned signals and blend into rank_score
                 # BPR affinity: personal preference signal (±10 points)
                 bpr_bonus = learned.get("bpr_affinity", 0.0) * 10.0
-                # Thompson Sampling: exploration bonus (0–5 points)
-                ts_bonus = learned.get("ts_exploration", 0.5) * 5.0
+                # Thompson Sampling: zero-centered uncertainty adjustment.
+                ts_bonus = _centered_ts_bonus(learned.get("ts_exploration", 0.5))
                 # Sequential fit: session flow signal (0–8 points)
                 seq_bonus = learned.get("sequential_fit", 0.0) * 8.0
                 # Predicted reward: learned skip/completion model (0–6 points)
@@ -1549,12 +1596,12 @@ class AIDJ:
         source_entropy = self._source_entropy(rows[:20])
 
         # Cold-start: boost exploration when seeds and history are thin
-        is_cold_start = len(session.seed_tracks) <= 3 and len(guild_stats) < 10
+        is_cold_start = _is_cold_start(len(session.seed_tracks), len(guild_stats))
         bandit_alpha = self._bandit_alpha
         mmr_lambda = self._mmr_lambda
         if is_cold_start:
-            bandit_alpha = max(bandit_alpha, 0.35)
-            mmr_lambda = max(mmr_lambda, 0.80)
+            bandit_alpha = max(bandit_alpha, 0.20)
+            mmr_lambda = max(mmr_lambda, 0.72)
 
         rows = self._bandit.apply(
             rows,
@@ -1572,6 +1619,7 @@ class AIDJ:
         for row in slate[:count]:
             recs.append(
                 RecommendedTrack(
+                    track_id=row.track_id,
                     title=row.title,
                     artist=row.artist,
                     score=row.rank_score,
@@ -1598,6 +1646,7 @@ class AIDJ:
             ranked_json = json.dumps(
                 [
                     {
+                        "track_id": r.track_id or self._track_id(r.title, r.artist),
                         "title": r.title,
                         "artist": r.artist,
                         "score": r.score,
@@ -1630,7 +1679,7 @@ class AIDJ:
     async def _mark_audit_chosen(self, event_id: str, rec: RecommendedTrack) -> None:
         if not event_id:
             return
-        chosen_id = self._track_id(rec.title, rec.artist)
+        chosen_id = str(rec.track_id or self._track_id(rec.title, rec.artist)).strip()
 
         def _write() -> None:
             with self._db_connect() as conn:
@@ -1640,7 +1689,10 @@ class AIDJ:
                 )
                 conn.commit()
 
-        await asyncio.to_thread(_write)
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:
+            logger.debug("Failed marking DJ audit chosen track: %s", exc)
 
     async def get_recommendations(self, guild_id: int, *, count: int = 0) -> list[RecommendedTrack]:
         session = self._sessions.get(guild_id)
@@ -1657,12 +1709,16 @@ class AIDJ:
             return []
 
         if recs_v2:
-            session.last_audit_event_id = await self._write_recommendation_audit(
+            audit_event_id = await self._write_recommendation_audit(
                 guild_id,
                 session,
                 served_model="v2",
                 ranked=recs_v2,
             )
+            session.last_audit_event_id = audit_event_id
+            for rec in recs_v2:
+                if not rec.audit_event_id:
+                    rec.audit_event_id = audit_event_id
         return recs_v2
 
     async def pop_next_recommendation(self, guild_id: int) -> Optional[RecommendedTrack]:
@@ -1678,8 +1734,12 @@ class AIDJ:
 
         rec = session.recommendation_buffer.pop(0)
         session.played_titles.add(self._title_artist_key(rec.title, rec.artist))
-        if session.last_audit_event_id:
-            await self._mark_audit_chosen(session.last_audit_event_id, rec)
+        audit_event_id = str(rec.audit_event_id or session.last_audit_event_id or "").strip()
+        if audit_event_id:
+            try:
+                await self._mark_audit_chosen(audit_event_id, rec)
+            except Exception as exc:
+                logger.debug("Failed marking chosen recommendation: %s", exc)
         return rec
 
     def trigger_prefetch(self, guild_id: int) -> None:
