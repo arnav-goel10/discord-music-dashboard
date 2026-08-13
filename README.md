@@ -1,8 +1,8 @@
-# Music Bot (Discord + Lavalink)
+# Discord Music Dashboard
 
-[![tests](https://github.com/arnav-goel10/music_bot/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/music_bot/actions)
+[![tests](https://github.com/arnav-goel10/discord-music-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/discord-music-dashboard/actions)
 
-A Discord music bot with an interactive `/music` dashboard, queue controls, Spotify playlist support, and Lavalink-powered playback.
+A Discord music bot built around an interactive `/music` dashboard, queue controls, Spotify playlist support, and Lavalink-powered playback.
 
 ## Features
 
