@@ -173,3 +173,19 @@ On successful startup you should see:
 ```bash
 python3 -m py_compile main.py cogs/music.py cogs/ui.py
 ```
+
+## Configuration
+
+All secrets load from environment variables; nothing sensitive is tracked.
+
+| Variable | Purpose |
+|---|---|
+| `DISCORD_TOKEN` | bot token |
+| `GENIUS_ACCESS_TOKEN` | lyrics provider (optional) |
+| `LYRICS_SPOTIFY_WEB_TOKEN` | lyrics fallback (optional) |
+
+The tracked `application.yml` uses Lavalink's public default password; change it for any real deployment.
+
+## Tests
+
+`python -m pytest tests/` runs the suite (39 tests: dashboard state, DJ index, tuning logic). CI runs it on every push.
