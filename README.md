@@ -1,5 +1,7 @@
 # Music Bot (Discord + Lavalink)
 
+[![tests](https://github.com/arnav-goel10/music_bot/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/music_bot/actions)
+
 A Discord music bot with an interactive `/music` dashboard, queue controls, Spotify playlist support, and Lavalink-powered playback.
 
 ## Features
@@ -143,6 +145,8 @@ On successful startup you should see:
 - `cogs/music.py` - command + player logic
 - `cogs/ui.py` - dashboard UI components
 - `utils/` - matching/resolver utilities
+- `tests/` - pytest suite (run in CI)
+- `scripts/dev/` - ad-hoc probes needing live services
 - `data/` - playlist/cache data
 - `logs/` - Lavalink logs (`spring.log`) and bot runtime logs (`bot.log`)
 
@@ -174,18 +178,8 @@ On successful startup you should see:
 python3 -m py_compile main.py cogs/music.py cogs/ui.py
 ```
 
-## Configuration
+## Tests and CI
 
-All secrets load from environment variables; nothing sensitive is tracked.
+`python -m pytest tests/` runs the suite: 39 tests covering dashboard state, the DJ index, and tuning logic. CI runs it on every push (CPU-only torch on runners). Ad-hoc integration probes that need live services (radio, YouTube Music, wavelink) live in `scripts/dev/` and are excluded from the suite.
 
-| Variable | Purpose |
-|---|---|
-| `DISCORD_TOKEN` | bot token |
-| `GENIUS_ACCESS_TOKEN` | lyrics provider (optional) |
-| `LYRICS_SPOTIFY_WEB_TOKEN` | lyrics fallback (optional) |
-
-The tracked `application.yml` uses Lavalink's public default password; change it for any real deployment.
-
-## Tests
-
-`python -m pytest tests/` runs the suite (39 tests: dashboard state, DJ index, tuning logic). CI runs it on every push.
+Security note: nothing sensitive is tracked; all secrets load from environment variables. The tracked `application.yml` ships Lavalink's public default password; change it for any real deployment.
