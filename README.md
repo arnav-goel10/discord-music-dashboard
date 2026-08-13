@@ -12,6 +12,7 @@ A Discord music bot built around an interactive `/music` dashboard, queue contro
 - Volume and audio effects controls
 - Lyrics support (dashboard `🎤` button) with live line sync, exact-first matching, provider fallback, and cache
 - Spotify playlist ingestion with background resolution and cache
+- AI DJ: hybrid vector retrieval (Qdrant primary, FAISS fallback) with bandit exploration and MMR slate reranking, learning from skips and completions, seeded by Last.fm similarity signals
 - Lavalink backend with YouTube plugin + lavasrc integration
 
 ## Requirements
@@ -183,3 +184,7 @@ python3 -m py_compile main.py cogs/music.py cogs/ui.py
 `python -m pytest tests/` runs the suite: 39 tests covering dashboard state, the DJ index, and tuning logic. CI runs it on every push (CPU-only torch on runners). Ad-hoc integration probes that need live services (radio, YouTube Music, wavelink) live in `scripts/dev/` and are excluded from the suite.
 
 Security note: nothing sensitive is tracked; all secrets load from environment variables. The tracked `application.yml` ships Lavalink's public default password; change it for any real deployment.
+
+## License
+
+MIT (see [LICENSE](LICENSE)).
