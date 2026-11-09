@@ -12,7 +12,7 @@ A Discord music bot built around an interactive `/music` dashboard, queue contro
 - Volume and audio effects controls
 - Lyrics support (dashboard `🎤` button) with live line sync, exact-first matching, provider fallback, and cache
 - Spotify playlist ingestion with background resolution and cache
-- AI DJ: hybrid vector retrieval (Qdrant primary, FAISS fallback) with bandit exploration and MMR slate reranking, learning from skips and completions, seeded by Last.fm similarity signals; every recommendation is audited, and an [offline evaluation harness](docs/dj-eval-demo.md) scores ranking quality, skip behaviour, and slate diversity
+- AI DJ: hybrid vector retrieval (Qdrant primary, with a local SQLite vector-search fallback) with bandit exploration and MMR slate reranking, learning from skips and completions, seeded by Last.fm similarity signals; every recommendation is audited, and an [offline evaluation harness](docs/dj-eval-demo.md) scores ranking quality, skip behaviour, and slate diversity
 - Lavalink backend with YouTube plugin + lavasrc integration
 
 ## Requirements
